@@ -25,7 +25,7 @@ function M.cycle_agent()
   end
   idx = (idx % #AGENTS) + 1
   current_agent = AGENTS[idx]
-  ui.set_session_info(current_agent, nil, nil)
+  ui.set_agent(current_agent)
   ui.notify("Agent → " .. current_agent, vim.log.levels.INFO)
 end
 
@@ -33,7 +33,7 @@ end
 ---@param agent string
 function M.set_agent(agent)
   current_agent = agent
-  ui.set_session_info(current_agent, nil, nil)
+  ui.set_agent(current_agent)
 end
 
 -- ─── Input pane ──────────────────────────────────────────────────────────────
