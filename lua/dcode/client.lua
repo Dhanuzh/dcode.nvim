@@ -145,9 +145,12 @@ function M.stream(path, payload, on_chunk, on_done)
   raw_req = raw_req:gsub("Accept: application/json", "Accept: text/event-stream")
 
   local tcp = vim.loop.new_tcp()
-  local raw_chunks = {}   -- accumulate raw TCP bytes
-  local header_done = false
-  local sse_buf     = ""  -- plain SSE text after header+chunked stripping
+  -- raw_pending: new bytes that arrived since the last vim.schedule fired
+  local raw_pending  = {}
+  local header_buf   = ""   -- accumulates bytes until HTTP headers are complete
+  local header_done  = false
+  local chunked      = false
+  local sse_buf      = ""   -- unprocessed SSE text (remainder between events)
 
   tcp:connect(config.host, config.port, function(err)
     if err then
@@ -163,34 +166,31 @@ function M.stream(path, payload, on_chunk, on_done)
       end
 
       if data then
-        table.insert(raw_chunks, data)
+        -- Stash the raw bytes; process on the main loop (avoids E5560).
+        table.insert(raw_pending, data)
 
-        -- All parsing + dispatching runs on the main loop (avoids E5560).
         vim.schedule(function()
-          local raw = table.concat(raw_chunks)
+          if #raw_pending == 0 then return end
+          local new_data = table.concat(raw_pending)
+          raw_pending = {}
 
-          -- Strip HTTP headers once
+          -- ── Strip HTTP headers (once) ──────────────────────────────────
           if not header_done then
-            local hdr_end = raw:find("\r\n\r\n", 1, true)
-            if not hdr_end then return end
-            -- Detect chunked encoding from headers
-            local headers = raw:sub(1, hdr_end - 1)
-            local chunked = headers:lower():find("transfer%-encoding:%s*chunked") ~= nil
-            local body_raw = raw:sub(hdr_end + 4)
+            header_buf = header_buf .. new_data
+            local hdr_end = header_buf:find("\r\n\r\n", 1, true)
+            if not hdr_end then return end  -- headers not yet complete
+            local headers = header_buf:sub(1, hdr_end - 1)
+            chunked = headers:lower():find("transfer%-encoding:%s*chunked") ~= nil
+            new_data = header_buf:sub(hdr_end + 4)  -- body bytes after headers
+            header_buf = ""
             header_done = true
-            sse_buf = chunked and decode_chunked(body_raw) or body_raw
-          else
-            -- Incremental: re-decode the whole body each time (simple, correct)
-            local raw2 = table.concat(raw_chunks)
-            local hdr_end = raw2:find("\r\n\r\n", 1, true)
-            if not hdr_end then return end
-            local headers = raw2:sub(1, hdr_end - 1)
-            local chunked = headers:lower():find("transfer%-encoding:%s*chunked") ~= nil
-            local body_raw = raw2:sub(hdr_end + 4)
-            sse_buf = chunked and decode_chunked(body_raw) or body_raw
           end
 
-          -- Process complete SSE events (\n\n separated)
+          -- ── Strip chunked framing from new_data only ───────────────────
+          local plain = chunked and decode_chunked(new_data) or new_data
+          sse_buf = sse_buf .. plain
+
+          -- ── Dispatch complete SSE events (\n\n separated) ─────────────
           while true do
             local event_end = sse_buf:find("\n\n", 1, true)
             if not event_end then break end

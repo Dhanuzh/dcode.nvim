@@ -8,24 +8,36 @@ local M = {}
 
 function M.setup_highlights()
   local h = function(g, o) vim.api.nvim_set_hl(0, g, o) end
-  h("DcodeBorder",    { fg = "#7aa2f7", bold = true })
-  h("DcodeTitle",     { fg = "#bb9af7", bold = true })
-  h("DcodeUser",      { fg = "#9ece6a", bold = true })
-  h("DcodeAssistant", { fg = "#7dcfff", bold = true })
-  h("DcodeTool",      { fg = "#e0af68", italic = true })
-  h("DcodeThinking",  { fg = "#565f89", italic = true })
-  h("DcodeCost",      { fg = "#565f89" })
-  h("DcodeSeparator", { fg = "#3b4261" })
-  h("DcodeStatusOk",  { fg = "#9ece6a" })
-  h("DcodeStatusErr", { fg = "#f7768e" })
-  h("DcodeAgentSel",  { fg = "#1a1b26", bg = "#7aa2f7", bold = true })
-  h("DcodeAgentOff",  { fg = "#565f89" })
+  -- Chat chrome
+  h("DcodeBorder",      { fg = "#414868" })
+  h("DcodeTitle",       { fg = "#bb9af7", bold = true })
+  h("DcodeSeparator",   { fg = "#292e42" })
+  -- Message headers
+  h("DcodeUser",        { fg = "#9ece6a", bold = true })
+  h("DcodeAssistant",   { fg = "#7aa2f7", bold = true })
+  -- Inline content
+  h("DcodeTool",        { fg = "#e0af68", italic = true })
+  h("DcodeThinking",    { fg = "#545c7e", italic = true })
+  h("DcodeError",       { fg = "#f7768e", bold = true })
+  h("DcodeCost",        { fg = "#3b4261" })
+  -- Status
+  h("DcodeStatusOk",    { fg = "#9ece6a" })
+  h("DcodeStatusErr",   { fg = "#f7768e" })
+  -- Agent selector
+  h("DcodeAgentSel",    { fg = "#1a1b26", bg = "#7aa2f7", bold = true })
+  h("DcodeAgentOff",    { fg = "#3b4261" })
+  -- Input pane hint text
+  h("DcodeHint",        { fg = "#3b4261", italic = true })
+  -- Status bar
+  h("DcodeStatusBar",   { fg = "#565f89", bg = "NONE" })
+  h("DcodeStatusAgent", { fg = "#7aa2f7", bold = true })
 end
 
 -- ─── Namespaces ──────────────────────────────────────────────────────────────
 
 local ns_spin   = vim.api.nvim_create_namespace("dcode_spin")
 local ns_agent  = vim.api.nvim_create_namespace("dcode_agent")
+local ns_hl     = vim.api.nvim_create_namespace("dcode_hl")
 
 -- ─── State ───────────────────────────────────────────────────────────────────
 
@@ -80,6 +92,16 @@ local function append(lines)
   end
 end
 
+-- Highlight a line (0-based lnum) with a given hl group over col range.
+local function hl_line(lnum, hl, col_start, col_end)
+  if not buf_ok() then return end
+  vim.api.nvim_buf_set_extmark(chat_buf, ns_hl, lnum, col_start or 0, {
+    end_col       = col_end,
+    hl_group      = hl,
+    priority      = 50,
+  })
+end
+
 local function scroll_bottom()
   if rwin_ok() and buf_ok() then
     local n = vim.api.nvim_buf_line_count(chat_buf)
@@ -108,7 +130,7 @@ local function spin_start()
     local last = math.max(0, vim.api.nvim_buf_line_count(chat_buf) - 1)
     spin_id = vim.api.nvim_buf_set_extmark(chat_buf, ns_spin, last, 0, {
       id            = spin_id or nil,
-      virt_text     = { { " " .. SPIN[spin_idx] .. " thinking…", "DcodeThinking" } },
+      virt_text     = { { "  " .. SPIN[spin_idx] .. " ", "DcodeThinking" } },
       virt_text_pos = "eol",
     })
   end))
@@ -118,15 +140,24 @@ end
 
 local AGENTS = { "coder", "planner", "explorer" }
 
+local AGENT_ICONS = { coder = "󰘧", planner = "󰗊", explorer = "󰥨" }
+
 local function redraw_agent_bar()
   if not buf_ok() then return end
   vim.api.nvim_buf_clear_namespace(chat_buf, ns_agent, 0, 1)
-  local chunks = {}
+  local chunks = { { " ", "DcodeAgentOff" } }
   for i, a in ipairs(AGENTS) do
-    local hl = (a == current_agent) and "DcodeAgentSel" or "DcodeAgentOff"
-    table.insert(chunks, { " " .. a .. " ", hl })
-    if i < #AGENTS then table.insert(chunks, { "  ", "DcodeAgentOff" }) end
+    local icon = (AGENT_ICONS[a] or "·") .. " "
+    if a == current_agent then
+      table.insert(chunks, { " " .. icon .. a .. " ", "DcodeAgentSel" })
+    else
+      table.insert(chunks, { " " .. icon .. a .. " ", "DcodeAgentOff" })
+    end
+    if i < #AGENTS then
+      table.insert(chunks, { "│", "DcodeSeparator" })
+    end
   end
+  table.insert(chunks, { " ", "DcodeAgentOff" })
   vim.api.nvim_buf_set_extmark(chat_buf, ns_agent, 0, 0, {
     virt_lines       = { chunks },
     virt_lines_above = true,
@@ -160,6 +191,7 @@ local function win_opts(win)
   s("signcolumn",     "no")
   s("cursorline",     false)
   s("foldcolumn",     "0")
+  s("scrolloff",      3)
   s("winhighlight",
     "Normal:Normal,NormalFloat:Normal,FloatBorder:DcodeBorder," ..
     "CursorLine:Normal,Search:None,IncSearch:None," ..
@@ -168,14 +200,18 @@ end
 
 -- ─── Statuslines ─────────────────────────────────────────────────────────────
 
+local function agent_icon()
+  return AGENT_ICONS[current_agent] or "·"
+end
+
 local function result_sl()
-  local mdl = current_model ~= "" and (" · " .. current_model) or ""
-  local ttl = current_title ~= "" and (" — " .. current_title:sub(1, 28)) or ""
-  return "  dcode · " .. current_agent .. mdl .. ttl .. " "
+  local mdl = current_model ~= "" and ("  " .. current_model) or ""
+  local ttl = current_title ~= "" and ("  " .. current_title:sub(1, 32)) or ""
+  return " 󱙺 dcode  " .. agent_icon() .. " " .. current_agent .. mdl .. ttl .. " "
 end
 
 local function input_sl()
-  return "  ask  <C-s> send  ·  <Esc> back  ·  <Tab> cycle agent "
+  return "  󰏫  %#DcodeHint#<C-s> send  ·  <Esc> back  ·  <Tab> agent%#DcodeStatusBar#"
 end
 
 function M.update_statuslines()
@@ -218,7 +254,7 @@ function M.open(opts)
 
   local w = opts.width or 0.40
   local sw = w > 1 and math.floor(w) or math.floor(vim.o.columns * w)
-  sw = math.max(sw, 32)
+  sw = math.max(sw, 40)
 
   local orig = vim.api.nvim_get_current_win()
   vim.cmd("vsplit")
@@ -233,8 +269,8 @@ function M.open(opts)
   local ko = { buffer = chat_buf, noremap = true, silent = true }
   vim.keymap.set("n", "q",     function() M.close() end, ko)
   vim.keymap.set("n", "<Esc>", function() M.close() end, ko)
-  vim.keymap.set("n", "i",  function() vim.schedule(function() require("dcode.commands").focus_or_open_input() end) end, ko)
-  vim.keymap.set("n", "<CR>", function() vim.schedule(function() require("dcode.commands").focus_or_open_input() end) end, ko)
+  vim.keymap.set("n", "i",     function() vim.schedule(function() require("dcode.commands").focus_or_open_input() end) end, ko)
+  vim.keymap.set("n", "<CR>",  function() vim.schedule(function() require("dcode.commands").focus_or_open_input() end) end, ko)
   vim.keymap.set("n", "<Tab>", function() vim.schedule(function() require("dcode.commands").cycle_agent() end) end, ko)
 
   vim.api.nvim_set_current_win(orig)
@@ -266,55 +302,70 @@ function M.result_winid() return rwin_ok() and result_win or nil end
 
 -- ─── Chat rendering ───────────────────────────────────────────────────────────
 
-local SEP = string.rep("─", 50)
+-- Shorter separator that fits comfortably in a 40-col pane
+local SEP = string.rep("─", 36)
 
 function M.render_user(text)
-  local lines = { "", "▶ You", SEP }
+  local first_line = buf_ok() and vim.api.nvim_buf_line_count(chat_buf) or 0
+  local lines = { "", "  You", SEP }
+  local text_start = first_line + 3  -- 1-based line of first content line
+
   for _, l in ipairs(vim.split(text, "\n", { plain = true })) do
-    table.insert(lines, l)
+    table.insert(lines, "  " .. l)
   end
   table.insert(lines, "")
   append(lines)
+
+  if buf_ok() then
+    -- Highlight the "  You" header line
+    local hdr_lnum = first_line + 1  -- 0-based
+    hl_line(hdr_lnum, "DcodeUser")
+    -- Dim the separator
+    hl_line(hdr_lnum + 1, "DcodeSeparator")
+    _ = text_start  -- suppress unused warning
+  end
 end
 
 function M.begin_assistant()
-  stream.buf    = ""
-  stream.active = true
+  stream.buf     = ""
+  stream.active  = true
   stream.pending = false
 
-  append({ "◀ dcode", SEP, "" })
+  local first_line = buf_ok() and vim.api.nvim_buf_line_count(chat_buf) or 0
+  append({ "  dcode", SEP, "" })
 
   if buf_ok() then
     local n    = vim.api.nvim_buf_line_count(chat_buf)
-    stream.row = n - 1  -- 0-based index of the blank line we just appended
+    stream.row = n - 1  -- 0-based index of the blank "" line
+
+    -- Highlight header
+    hl_line(first_line, "DcodeAssistant")
+    hl_line(first_line + 1, "DcodeSeparator")
   end
 
   spin_start()
 end
 
 -- ─── Core flush ──────────────────────────────────────────────────────────────
--- Writes stream.buf to the buffer starting at stream.row.
--- Resets stream.buf="" and advances stream.row. Does NOT check stream.active.
+-- Writes stream.buf into the buffer at stream.row, advancing row on newlines.
 
 local function do_flush()
   if not buf_ok() then stream.pending = false; return end
   if stream.buf == "" then stream.pending = false; return end
 
   local text = stream.buf
-  stream.buf = ""  -- reset immediately so re-entrant calls see empty buf
+  stream.buf = ""
 
   with_mod(function()
     local parts = vim.split(text, "\n", { plain = true })
 
-    -- Ensure buffer has enough lines
-    local n = vim.api.nvim_buf_line_count(chat_buf)
-    local need = stream.row + #parts  -- need lines 0..stream.row+#parts-1
+    local n    = vim.api.nvim_buf_line_count(chat_buf)
+    local need = stream.row + #parts
     while n < need do
       vim.api.nvim_buf_set_lines(chat_buf, n, n, false, { "" })
       n = n + 1
     end
 
-    -- Write each part
     for i, part in ipairs(parts) do
       local lnum = stream.row + i - 1
       vim.api.nvim_buf_set_lines(chat_buf, lnum, lnum + 1, false, { part })
@@ -323,7 +374,6 @@ local function do_flush()
     stream.row = stream.row + #parts - 1
   end)
 
-  -- Auto-scroll
   if rwin_ok() then
     local n   = vim.api.nvim_buf_line_count(chat_buf)
     local cur = vim.api.nvim_win_get_cursor(result_win)[1]
@@ -347,10 +397,12 @@ end
 
 function M.render_tool(name, detail)
   do_flush()
-  local line = "  ⚙ " .. name
-  if detail and detail ~= "" then line = line .. " — " .. detail:sub(1, 60) end
+  local line = "  ⚙  " .. name
+  if detail and detail ~= "" then line = line .. "  " .. detail:sub(1, 55) end
+  local lnum = buf_ok() and vim.api.nvim_buf_line_count(chat_buf) or 0
   append({ line, "" })
   if buf_ok() then
+    hl_line(lnum, "DcodeTool")
     stream.row = vim.api.nvim_buf_line_count(chat_buf) - 1
     stream.buf = ""
   end
@@ -358,8 +410,11 @@ end
 
 function M.render_thinking(text)
   do_flush()
-  append({ "  ≋ " .. text:sub(1, 100), "" })
+  local line = "  󰔫  " .. text:sub(1, 90)
+  local lnum = buf_ok() and vim.api.nvim_buf_line_count(chat_buf) or 0
+  append({ line, "" })
   if buf_ok() then
+    hl_line(lnum, "DcodeThinking")
     stream.row = vim.api.nvim_buf_line_count(chat_buf) - 1
     stream.buf = ""
   end
@@ -367,19 +422,21 @@ end
 
 function M.end_assistant(cost, tokens)
   spin_stop()
-  do_flush()           -- flush BEFORE setting active=false
-  stream.active = false
-  stream.buf    = ""
+  do_flush()
+  stream.active  = false
+  stream.buf     = ""
   stream.pending = false
 
   local footer = {}
   if tokens and ((tokens.input or 0) > 0 or (tokens.output or 0) > 0) then
-    local s = string.format("  in:%d out:%d", tokens.input or 0, tokens.output or 0)
+    local s = string.format("  in %d  out %d", tokens.input or 0, tokens.output or 0)
     if cost and cost > 0 then s = s .. string.format("  $%.5f", cost) end
+    local lnum = buf_ok() and vim.api.nvim_buf_line_count(chat_buf) or 0
     table.insert(footer, s)
+    append(footer)
+    if buf_ok() then hl_line(lnum, "DcodeCost") end
   end
-  table.insert(footer, "")
-  append(footer)
+  append({ "" })
   scroll_bottom()
 end
 
@@ -388,7 +445,9 @@ function M.render_error(msg)
   do_flush()
   stream.active = false
   stream.buf    = ""
-  append({ "", "  ✗ " .. msg, "" })
+  local lnum = buf_ok() and vim.api.nvim_buf_line_count(chat_buf) or 0
+  append({ "", "  ✗  " .. msg, "" })
+  if buf_ok() then hl_line(lnum + 1, "DcodeError") end
   scroll_bottom()
 end
 
@@ -402,6 +461,7 @@ function M.reset()
   stream.pending = false
   spin_stop()
   if buf_ok() then
+    vim.api.nvim_buf_clear_namespace(chat_buf, ns_hl, 0, -1)
     with_mod(function()
       vim.api.nvim_buf_set_lines(chat_buf, 0, -1, false, { "" })
     end)
