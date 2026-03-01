@@ -107,16 +107,34 @@ function M.request(method, path, payload, on_done)
   end)
 end
 
--- ─── Debug logging (shared with ui.lua) ─────────────────────────────────────
-local _logfile = io.open("/tmp/dcode_debug.log", "a")
-local function dbg(...)
-  if _logfile then
-    _logfile:write(table.concat(vim.tbl_map(tostring, {...}), " ") .. "\n")
-    _logfile:flush()
+--- Decode HTTP chunked transfer encoding.
+--- Strips the hex-size\r\n ... \r\n wrappers, returns plain body bytes.
+---@param s string
+---@return string
+local function decode_chunked(s)
+  local out = {}
+  local pos = 1
+  while pos <= #s do
+    -- Find the chunk-size line ending
+    local nl = s:find("\r\n", pos, true)
+    if not nl then break end
+    local size_str = s:sub(pos, nl - 1)
+    -- Strip any chunk extensions (;...)
+    size_str = size_str:match("^([0-9a-fA-F]+)")
+    if not size_str then break end
+    local size = tonumber(size_str, 16)
+    if not size or size == 0 then break end  -- last chunk
+    local data_start = nl + 2
+    local data_end   = data_start + size - 1
+    if data_end > #s then break end  -- incomplete — shouldn't happen with our buffering
+    table.insert(out, s:sub(data_start, data_end))
+    pos = data_end + 3  -- skip trailing \r\n after chunk data
   end
+  return table.concat(out)
 end
 
 --- Streaming request — calls on_chunk for every SSE "data:" line, on_done at end.
+--- NOTE: all parsing happens inside vim.schedule (main loop) to avoid E5560.
 ---@param path     string             e.g. "/session/abc123/prompt"
 ---@param payload  table              Request body
 ---@param on_chunk fun(event: table)  Called for each parsed SSE event
@@ -124,93 +142,77 @@ end
 function M.stream(path, payload, on_chunk, on_done)
   local body = vim.fn.json_encode(payload)
   local raw_req = build_request("POST", path, body)
-  -- Override Accept for SSE
   raw_req = raw_req:gsub("Accept: application/json", "Accept: text/event-stream")
 
-  local loop = vim.loop
-  local tcp = loop.new_tcp()
-  local buf = ""
+  local tcp = vim.loop.new_tcp()
+  local raw_chunks = {}   -- accumulate raw TCP bytes
   local header_done = false
-
-  dbg("stream: connecting to", config.host, config.port, path)
+  local sse_buf     = ""  -- plain SSE text after header+chunked stripping
 
   tcp:connect(config.host, config.port, function(err)
     if err then
-      dbg("stream: connect error:", err)
-      vim.schedule(function()
-        on_done("connect error: " .. err)
-      end)
+      vim.schedule(function() on_done("connect error: " .. err) end)
       return
     end
 
-    dbg("stream: connected")
-
     tcp:read_start(function(read_err, data)
       if read_err then
-        dbg("stream: read error:", read_err)
         tcp:close()
-        vim.schedule(function()
-          on_done("read error: " .. read_err)
-        end)
+        vim.schedule(function() on_done("read error: " .. read_err) end)
         return
       end
 
       if data then
-        dbg("stream: raw chunk len=", #data, "repr=", data:sub(1, 120):gsub("\r", "\\r"):gsub("\n", "\\n"))
-        buf = buf .. data
+        table.insert(raw_chunks, data)
 
-        -- Skip HTTP headers on first pass
-        if not header_done then
-          local hdr_end = buf:find("\r\n\r\n", 1, true)
-          if hdr_end then
-            buf = buf:sub(hdr_end + 4)
+        -- All parsing + dispatching runs on the main loop (avoids E5560).
+        vim.schedule(function()
+          local raw = table.concat(raw_chunks)
+
+          -- Strip HTTP headers once
+          if not header_done then
+            local hdr_end = raw:find("\r\n\r\n", 1, true)
+            if not hdr_end then return end
+            -- Detect chunked encoding from headers
+            local headers = raw:sub(1, hdr_end - 1)
+            local chunked = headers:lower():find("transfer%-encoding:%s*chunked") ~= nil
+            local body_raw = raw:sub(hdr_end + 4)
             header_done = true
-            dbg("stream: headers done, SSE buf starts:", buf:sub(1, 80):gsub("\r", "\\r"):gsub("\n", "\\n"))
+            sse_buf = chunked and decode_chunked(body_raw) or body_raw
           else
-            dbg("stream: waiting for header end, buf so far len=", #buf)
-            return
+            -- Incremental: re-decode the whole body each time (simple, correct)
+            local raw2 = table.concat(raw_chunks)
+            local hdr_end = raw2:find("\r\n\r\n", 1, true)
+            if not hdr_end then return end
+            local headers = raw2:sub(1, hdr_end - 1)
+            local chunked = headers:lower():find("transfer%-encoding:%s*chunked") ~= nil
+            local body_raw = raw2:sub(hdr_end + 4)
+            sse_buf = chunked and decode_chunked(body_raw) or body_raw
           end
-        end
 
-        -- Process complete SSE events (separated by blank line \n\n)
-        local iterations = 0
-        while true do
-          iterations = iterations + 1
-          if iterations > 100 then dbg("stream: loop guard hit"); break end
+          -- Process complete SSE events (\n\n separated)
+          while true do
+            local event_end = sse_buf:find("\n\n", 1, true)
+            if not event_end then break end
+            local block = sse_buf:sub(1, event_end - 1)
+            sse_buf = sse_buf:sub(event_end + 2)
 
-          local event_end = buf:find("\n\n", 1, true)
-          dbg("stream: looking for \\n\\n in buf len=", #buf, "found=", tostring(event_end))
-          if not event_end then break end
-
-          local event_block = buf:sub(1, event_end - 1)
-          buf = buf:sub(event_end + 2)
-          dbg("stream: event_block=", event_block:gsub("\r","\\r"):gsub("\n","\\n"), "remaining buf len=", #buf)
-
-          -- Extract data: lines
-          for line in event_block:gmatch("[^\n]+") do
-            local payload_str = line:match("^data: (.+)$")
-            dbg("stream: line=", line:sub(1,60), "payload_str=", tostring(payload_str and payload_str:sub(1,60)))
-            if payload_str then
-              local ok, event = pcall(vim.fn.json_decode, payload_str)
-              dbg("stream: json_decode ok=", ok, "type=", ok and type(event) == "table" and event.type or "?")
-              if ok and type(event) == "table" then
-                vim.schedule(function()
-                  dbg("stream: dispatching event type=", event.type)
+            for line in block:gmatch("[^\n]+") do
+              local payload_str = line:match("^data:%s*(.+)$")
+              if payload_str then
+                local ok, event = pcall(vim.fn.json_decode, payload_str)
+                if ok and type(event) == "table" then
                   on_chunk(event)
-                end)
-              else
-                dbg("stream: json_decode failed:", tostring(event))
+                end
               end
             end
           end
-        end
+        end)
+
       else
         -- EOF
-        dbg("stream: EOF")
         tcp:close()
-        vim.schedule(function()
-          on_done(nil)
-        end)
+        vim.schedule(function() on_done(nil) end)
       end
     end)
 

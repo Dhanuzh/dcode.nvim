@@ -4,15 +4,6 @@
 
 local M = {}
 
--- ─── Debug logging ───────────────────────────────────────────────────────────
-local _logfile = io.open("/tmp/dcode_debug.log", "a")
-local function dbg(...)
-  if _logfile then
-    _logfile:write(table.concat(vim.tbl_map(tostring, {...}), " ") .. "\n")
-    _logfile:flush()
-  end
-end
-
 -- ─── Highlights ──────────────────────────────────────────────────────────────
 
 function M.setup_highlights()
@@ -66,12 +57,12 @@ local function rwin_ok() return result_win ~= nil and vim.api.nvim_win_is_valid(
 -- ─── Write helpers ───────────────────────────────────────────────────────────
 
 local function with_mod(fn)
-  if not buf_ok() then dbg("with_mod: buf_ok() false"); return end
-  local ok1, err1 = pcall(vim.api.nvim_set_option_value, "modifiable", true, { buf = chat_buf })
-  if not ok1 then dbg("with_mod: set modifiable=true failed:", err1); return end
+  if not buf_ok() then return end
+  local ok1 = pcall(vim.api.nvim_set_option_value, "modifiable", true, { buf = chat_buf })
+  if not ok1 then return end
   local ok2, err2 = pcall(fn)
   pcall(vim.api.nvim_set_option_value, "modifiable", false, { buf = chat_buf })
-  if not ok2 then dbg("with_mod: fn failed:", err2); vim.notify("[dcode] " .. tostring(err2), vim.log.levels.ERROR) end
+  if not ok2 then vim.notify("[dcode] " .. tostring(err2), vim.log.levels.ERROR) end
 end
 
 local function append(lines)
@@ -296,7 +287,6 @@ function M.begin_assistant()
   if buf_ok() then
     local n    = vim.api.nvim_buf_line_count(chat_buf)
     stream.row = n - 1  -- 0-based index of the blank line we just appended
-    dbg("begin_assistant: stream.row =", stream.row, "buf lines =", n)
   end
 
   spin_start()
@@ -307,7 +297,6 @@ end
 -- Resets stream.buf="" and advances stream.row. Does NOT check stream.active.
 
 local function do_flush()
-  dbg("do_flush called: buf_ok=", buf_ok(), "stream.buf=|"..stream.buf.."|", "stream.row=", stream.row, "active=", stream.active)
   if not buf_ok() then stream.pending = false; return end
   if stream.buf == "" then stream.pending = false; return end
 
@@ -316,12 +305,10 @@ local function do_flush()
 
   with_mod(function()
     local parts = vim.split(text, "\n", { plain = true })
-    dbg("do_flush: parts=", vim.inspect(parts), "stream.row=", stream.row)
 
     -- Ensure buffer has enough lines
     local n = vim.api.nvim_buf_line_count(chat_buf)
     local need = stream.row + #parts  -- need lines 0..stream.row+#parts-1
-    dbg("do_flush: n=", n, "need=", need)
     while n < need do
       vim.api.nvim_buf_set_lines(chat_buf, n, n, false, { "" })
       n = n + 1
@@ -330,12 +317,10 @@ local function do_flush()
     -- Write each part
     for i, part in ipairs(parts) do
       local lnum = stream.row + i - 1
-      dbg("do_flush: writing line", lnum, "|"..part.."|")
       vim.api.nvim_buf_set_lines(chat_buf, lnum, lnum + 1, false, { part })
     end
 
     stream.row = stream.row + #parts - 1
-    dbg("do_flush: new stream.row =", stream.row)
   end)
 
   -- Auto-scroll
@@ -349,7 +334,6 @@ local function do_flush()
 end
 
 function M.append_stream_text(chunk)
-  dbg("append_stream_text: active=", stream.active, "chunk=|"..chunk.."|")
   if not stream.active then return end
   stream.buf = stream.buf .. chunk
   if stream.pending then return end
@@ -382,7 +366,6 @@ function M.render_thinking(text)
 end
 
 function M.end_assistant(cost, tokens)
-  dbg("end_assistant called: stream.buf=|"..stream.buf.."|", "active=", stream.active)
   spin_stop()
   do_flush()           -- flush BEFORE setting active=false
   stream.active = false
@@ -398,7 +381,6 @@ function M.end_assistant(cost, tokens)
   table.insert(footer, "")
   append(footer)
   scroll_bottom()
-  dbg("end_assistant done")
 end
 
 function M.render_error(msg)

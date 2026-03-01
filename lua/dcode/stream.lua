@@ -6,15 +6,6 @@ local ui     = require("dcode.ui")
 
 local M = {}
 
--- ─── Debug logging ───────────────────────────────────────────────────────────
-local _logfile = io.open("/tmp/dcode_debug.log", "a")
-local function dbg(...)
-  if _logfile then
-    _logfile:write(table.concat(vim.tbl_map(tostring, {...}), " ") .. "\n")
-    _logfile:flush()
-  end
-end
-
 --- Stream a prompt to the dcode server and render events into the chat UI.
 ---@param session_id   string
 ---@param message      string   Full message sent to API (may include code context)
@@ -40,7 +31,6 @@ function M.run(session_id, message, display_text, on_done)
 
     function(event)
       local t = event.type
-      dbg("stream.run: on_chunk event.type=", t, "content=", tostring((event.content or ""):sub(1,40)))
 
       if t == "text" then
         ui.append_stream_text(event.content or "")
