@@ -1,11 +1,13 @@
 -- lua/dcode/ui.lua
--- All UI: floating chat window, sidebar, input prompt, highlights.
+-- Chat window: persistent buffer, nvim_buf_set_text streaming, extmark spinner,
+-- 50ms throttle, conditional cursor follow, named filetype.
+-- Pattern credit: CopilotChat.nvim / avante.nvim
 
 local M = {}
 
--- ─── Highlight groups ────────────────────────────────────────────────────────
+-- ─── Highlight setup ─────────────────────────────────────────────────────────
 
-local hl = {
+local HL = {
   border    = "DcodeBorder",
   title     = "DcodeTitle",
   user      = "DcodeUser",
@@ -19,356 +21,444 @@ local hl = {
 }
 
 function M.setup_highlights()
-  local function hi(group, opts)
-    vim.api.nvim_set_hl(0, group, opts)
-  end
-  hi(hl.border,    { fg = "#7aa2f7", bold = true })
-  hi(hl.title,     { fg = "#bb9af7", bold = true })
-  hi(hl.user,      { fg = "#9ece6a", bold = true })
-  hi(hl.assistant, { fg = "#7dcfff", bold = true })
-  hi(hl.tool,      { fg = "#e0af68", italic = true })
-  hi(hl.thinking,  { fg = "#565f89", italic = true })
-  hi(hl.cost,      { fg = "#565f89" })
-  hi(hl.separator, { fg = "#3b4261" })
-  hi(hl.status_ok, { fg = "#9ece6a" })
-  hi(hl.status_err,{ fg = "#f7768e" })
-  -- Suppress markdown code-fence background highlight bleed in the chat window
-  -- (set via winhighlight per-window in open())
+  local h = function(g, o) vim.api.nvim_set_hl(0, g, o) end
+  h(HL.border,    { fg = "#7aa2f7", bold = true })
+  h(HL.title,     { fg = "#bb9af7", bold = true })
+  h(HL.user,      { fg = "#9ece6a", bold = true })
+  h(HL.assistant, { fg = "#7dcfff", bold = true })
+  h(HL.tool,      { fg = "#e0af68", italic = true })
+  h(HL.thinking,  { fg = "#565f89", italic = true })
+  h(HL.cost,      { fg = "#565f89" })
+  h(HL.separator, { fg = "#3b4261" })
+  h(HL.status_ok, { fg = "#9ece6a" })
+  h(HL.status_err,{ fg = "#f7768e" })
 end
 
 -- ─── State ───────────────────────────────────────────────────────────────────
 
----@class DcodeWindow
----@field buf  integer
----@field win  integer
----@field lines string[]
+local ns_spinner = vim.api.nvim_create_namespace("dcode_spinner")
+local ns_header  = vim.api.nvim_create_namespace("dcode_header")
 
-local chat_win = nil  ---@type DcodeWindow|nil
-local state = {
-  session_id   = nil,  ---@type string|nil
-  session_title= "dcode",
-  streaming    = false,
-  stream_start_line = 0,  -- line index where current assistant reply starts
-  status       = "",
+-- Single persistent chat buffer (never wiped, only grown)
+local chat_buf  = nil   ---@type integer|nil
+local chat_win  = nil   ---@type integer|nil
+
+-- Streaming state
+local stream = {
+  active     = false,
+  buf        = "",          -- partial line accumulator
+  last_line  = 0,           -- 0-based line of the partial cursor line
+  last_col   = 0,           -- byte col of end of partial line
+  timer      = nil,         -- throttle timer
+  pending    = false,       -- dirty flag for throttle
 }
+
+local spinner_extmark_id = nil
+local SPINNER_FRAMES = { "⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏" }
+local spinner_idx = 0
+local spinner_timer = nil
 
 -- ─── Buffer helpers ───────────────────────────────────────────────────────────
 
---- Set a buffer option compatibly across Nvim versions.
-local function buf_set(buf, name, value)
-  if vim.fn.has("nvim-0.10") == 1 then
-    vim.api.nvim_set_option_value(name, value, { buf = buf })
-  else
-    vim.api.nvim_buf_set_option(buf, name, value)  -- luacheck: ignore
+local function buf_valid()
+  return chat_buf ~= nil and vim.api.nvim_buf_is_valid(chat_buf)
+end
+
+local function win_valid()
+  return chat_win ~= nil and vim.api.nvim_win_is_valid(chat_win)
+end
+
+local function buf_set(name, value)
+  if not buf_valid() then return end
+  vim.api.nvim_set_option_value(name, value, { buf = chat_buf })
+end
+
+local function win_set_opt(name, value)
+  if not win_valid() then return end
+  vim.api.nvim_set_option_value(name, value, { win = chat_win })
+end
+
+--- Set buf modifiable, run fn, restore to non-modifiable.
+local function with_modifiable(fn)
+  if not buf_valid() then return end
+  vim.api.nvim_set_option_value("modifiable", true, { buf = chat_buf })
+  local ok, err = pcall(fn)
+  vim.api.nvim_set_option_value("modifiable", false, { buf = chat_buf })
+  if not ok then vim.notify("[dcode] ui error: " .. tostring(err), vim.log.levels.ERROR) end
+end
+
+--- Append lines to buffer. Conditionally auto-scroll.
+local function buf_append_lines(lines)
+  if not buf_valid() then return end
+  with_modifiable(function()
+    local count = vim.api.nvim_buf_line_count(chat_buf)
+    vim.api.nvim_buf_set_lines(chat_buf, count, count, false, lines)
+  end)
+  if win_valid() then
+    local count   = vim.api.nvim_buf_line_count(chat_buf)
+    local cur_row = vim.api.nvim_win_get_cursor(chat_win)[1]
+    -- Only auto-scroll if cursor is near the bottom (within 3 lines)
+    -- Respects user scrolling up to review history
+    if cur_row >= count - 3 then
+      vim.api.nvim_win_set_cursor(chat_win, { count, 0 })
+    end
   end
 end
 
---- Set a window option compatibly across Nvim versions.
-local function win_set(win, name, value)
-  if vim.fn.has("nvim-0.10") == 1 then
-    vim.api.nvim_set_option_value(name, value, { win = win })
-  else
-    vim.api.nvim_win_set_option(win, name, value)  -- luacheck: ignore
+-- ─── Spinner ─────────────────────────────────────────────────────────────────
+
+local function spinner_stop()
+  if spinner_timer then
+    spinner_timer:stop()
+    spinner_timer:close()
+    spinner_timer = nil
+  end
+  if buf_valid() and spinner_extmark_id then
+    pcall(vim.api.nvim_buf_del_extmark, chat_buf, ns_spinner, spinner_extmark_id)
+    spinner_extmark_id = nil
   end
 end
 
---- Append lines to the chat buffer (always modifiable).
----@param lines string[]
-local function buf_append(lines)
-  if not chat_win or not vim.api.nvim_buf_is_valid(chat_win.buf) then return end
-  buf_set(chat_win.buf, "modifiable", true)
-  local last = vim.api.nvim_buf_line_count(chat_win.buf)
-  vim.api.nvim_buf_set_lines(chat_win.buf, last, last, false, lines)
-  buf_set(chat_win.buf, "modifiable", false)
-  -- Scroll to bottom if window is valid
-  if vim.api.nvim_win_is_valid(chat_win.win) then
-    local new_last = vim.api.nvim_buf_line_count(chat_win.buf)
-    vim.api.nvim_win_set_cursor(chat_win.win, { new_last, 0 })
-  end
+local function spinner_start()
+  spinner_stop()
+  if not buf_valid() then return end
+  spinner_idx = 0
+  spinner_timer = vim.loop.new_timer()
+  spinner_timer:start(0, 80, vim.schedule_wrap(function()
+    if not buf_valid() then spinner_stop(); return end
+    spinner_idx = (spinner_idx % #SPINNER_FRAMES) + 1
+    local last = math.max(0, vim.api.nvim_buf_line_count(chat_buf) - 1)
+    spinner_extmark_id = vim.api.nvim_buf_set_extmark(chat_buf, ns_spinner, last, 0, {
+      id       = spinner_extmark_id or nil,
+      virt_text= { { " " .. SPINNER_FRAMES[spinner_idx] .. " thinking…", HL.thinking } },
+      virt_text_pos = "eol",
+    })
+  end))
 end
 
---- Replace the last N lines of the chat buffer.
----@param n     integer  number of lines to replace
----@param lines string[]
-local function buf_replace_tail(n, lines)
-  if not chat_win or not vim.api.nvim_buf_is_valid(chat_win.buf) then return end
-  buf_set(chat_win.buf, "modifiable", true)
-  local last = vim.api.nvim_buf_line_count(chat_win.buf)
-  vim.api.nvim_buf_set_lines(chat_win.buf, last - n, last, false, lines)
-  buf_set(chat_win.buf, "modifiable", false)
-  if vim.api.nvim_win_is_valid(chat_win.win) then
-    local new_last = vim.api.nvim_buf_line_count(chat_win.buf)
-    vim.api.nvim_win_set_cursor(chat_win.win, { new_last, 0 })
-  end
+-- ─── Window open / close / toggle ────────────────────────────────────────────
+
+--- Ensure a persistent chat buffer exists.
+local function ensure_buf()
+  if buf_valid() then return end
+  chat_buf = vim.api.nvim_create_buf(false, true)
+  -- Named filetype so treesitter renders markdown inside it
+  vim.api.nvim_set_option_value("filetype",   "dcode-chat", { buf = chat_buf })
+  vim.api.nvim_set_option_value("bufhidden",  "hide",       { buf = chat_buf })
+  vim.api.nvim_set_option_value("modifiable", false,        { buf = chat_buf })
+  vim.api.nvim_set_option_value("buftype",    "nofile",     { buf = chat_buf })
+  -- Register dcode-chat as markdown for treesitter
+  pcall(vim.treesitter.language.register, "markdown", "dcode-chat")
+  -- Show welcome lines
+  with_modifiable(function()
+    vim.api.nvim_buf_set_lines(chat_buf, 0, -1, false, {
+      "  dcode chat",
+      "  i / <leader>da  — ask",
+      "  q / <Esc>       — close",
+      "  <leader>ds      — browse sessions",
+      "",
+    })
+  end)
 end
 
--- ─── Window creation ─────────────────────────────────────────────────────────
-
----@class DcodeWindowOpts
----@field style  "float"|"vsplit"|"split"
----@field width  number   0–1 fraction of screen width (for float/vsplit)
----@field height number   0–1 fraction of screen height (for float/split)
-
---- Open (or focus) the chat window.
----@param opts DcodeWindowOpts
+---@param opts table  { style, width, height }
 function M.open(opts)
   opts = opts or {}
-  local style  = opts.style  or "float"
-  local wfrac  = opts.width  or 0.45
-  local hfrac  = opts.height or 0.80
+  local style = opts.style  or "float"
+  local wfrac = opts.width  or 0.45
+  local hfrac = opts.height or 0.80
 
-  -- If already open, just focus it
-  if chat_win and vim.api.nvim_win_is_valid(chat_win.win) then
-    vim.api.nvim_set_current_win(chat_win.win)
+  if win_valid() then
+    vim.api.nvim_set_current_win(chat_win)
     return
   end
 
-  -- Re-use existing buffer if valid, otherwise create fresh
-  local buf
-  if chat_win and vim.api.nvim_buf_is_valid(chat_win.buf) then
-    buf = chat_win.buf
-    -- Clear stale content from previous session
-    buf_set(buf, "modifiable", true)
-    vim.api.nvim_buf_set_lines(buf, 0, -1, false, {})
-    buf_set(buf, "modifiable", false)
-  else
-    buf = vim.api.nvim_create_buf(false, true)
-    -- Use plain text — not markdown — to avoid syntax hl painting
-    -- code-fence backgrounds (the teal bleed in the screenshot)
-    buf_set(buf, "filetype", "")
-    buf_set(buf, "modifiable", false)
-    buf_set(buf, "bufhidden", "hide")
-  end
+  ensure_buf()
 
   local win
   if style == "float" then
-    local total_w = vim.o.columns
-    local total_h = vim.o.lines - vim.o.cmdheight - 2
-    local w = math.floor(total_w * wfrac)
-    local h = math.floor(total_h * hfrac)
-    local row = math.floor((total_h - h) / 2)
-    local col = math.floor((total_w - w) / 2)
-
-    win = vim.api.nvim_open_win(buf, true, {
-      relative = "editor",
-      width    = w,
-      height   = h,
-      row      = row,
-      col      = col,
-      style    = "minimal",
-      border   = "rounded",
-      title    = " dcode — " .. state.session_title .. " ",
-      title_pos= "center",
+    local tw = vim.o.columns
+    local th = vim.o.lines - vim.o.cmdheight - 2
+    local w  = math.floor(tw * wfrac)
+    local h  = math.floor(th * hfrac)
+    win = vim.api.nvim_open_win(chat_buf, true, {
+      relative  = "editor",
+      width     = w,
+      height    = h,
+      row       = math.floor((th - h) / 2),
+      col       = math.floor((tw - w) / 2),
+      style     = "minimal",
+      border    = "rounded",
+      title     = " dcode ",
+      title_pos = "center",
     })
   elseif style == "vsplit" then
-    local w = math.floor(vim.o.columns * wfrac)
     vim.cmd("vsplit")
     win = vim.api.nvim_get_current_win()
-    vim.api.nvim_win_set_buf(win, buf)
-    vim.api.nvim_win_set_width(win, w)
-  else -- split (horizontal)
-    local h = math.floor(vim.o.lines * hfrac)
+    vim.api.nvim_win_set_buf(win, chat_buf)
+    vim.api.nvim_win_set_width(win, math.floor(vim.o.columns * wfrac))
+  else
     vim.cmd("split")
     win = vim.api.nvim_get_current_win()
-    vim.api.nvim_win_set_buf(win, buf)
-    vim.api.nvim_win_set_height(win, h)
+    vim.api.nvim_win_set_buf(win, chat_buf)
+    vim.api.nvim_win_set_height(win, math.floor(vim.o.lines * hfrac))
   end
 
-  win_set(win, "wrap", true)
-  win_set(win, "linebreak", true)
-  win_set(win, "number", false)
-  win_set(win, "signcolumn", "no")
-  win_set(win, "cursorline", false)
-  -- Suppress ALL syntax-driven bg highlights inside the chat window:
-  -- Normal, NormalFloat, Search, Visual, CursorLine all map to plain Normal
-  win_set(win, "winhighlight",
-    "Normal:Normal,NormalFloat:Normal,FloatBorder:" .. hl.border ..
-    ",Search:Normal,IncSearch:Normal,Visual:Visual,CursorLine:Normal" ..
-    ",markdownCode:Normal,markdownCodeBlock:Normal"
-  )
+  chat_win = win
 
-  -- Close / input keymaps inside the chat window
-  local kopts = { buffer = buf, noremap = true, silent = true }
-  vim.keymap.set("n", "q",     function() M.close() end, kopts)
-  vim.keymap.set("n", "<Esc>", function() M.close() end, kopts)
+  vim.api.nvim_set_option_value("wrap",        true,  { win = win })
+  vim.api.nvim_set_option_value("linebreak",   true,  { win = win })
+  vim.api.nvim_set_option_value("number",      false, { win = win })
+  vim.api.nvim_set_option_value("signcolumn",  "no",  { win = win })
+  vim.api.nvim_set_option_value("cursorline",  false, { win = win })
+  -- Suppress any background highlight bleed (code fences, visual, etc.)
+  vim.api.nvim_set_option_value("winhighlight",
+    "Normal:Normal,NormalFloat:Normal,FloatBorder:" .. HL.border ..
+    ",CursorLine:Normal,Search:None,IncSearch:None",
+    { win = win })
+
+  -- Scroll to bottom on open
+  local count = vim.api.nvim_buf_line_count(chat_buf)
+  vim.api.nvim_win_set_cursor(win, { count, 0 })
+
+  -- Buffer-local close / input keymaps
+  local ko = { buffer = chat_buf, noremap = true, silent = true }
+  vim.keymap.set("n", "q",     function() M.close() end, ko)
+  vim.keymap.set("n", "<Esc>", function() M.close() end, ko)
   vim.keymap.set("n", "i",     function()
-    -- Open the input prompt instead of inserting into the read-only buffer
-    vim.schedule(function() require("dcode.commands").prompt_input() end)
-  end, kopts)
-
-  chat_win = { buf = buf, win = win, lines = {} }
-
-  -- Show welcome header
-  buf_set(buf, "modifiable", true)
-  vim.api.nvim_buf_set_lines(buf, 0, -1, false, {
-    "  dcode chat",
-    "  Press i or <leader>da to ask",
-    "  Press q / <Esc> to close",
-    "  Press <leader>ds to browse sessions",
-    "",
-  })
-  buf_set(buf, "modifiable", false)
+    vim.schedule(function() require("dcode.commands").open_input() end)
+  end, ko)
+  vim.keymap.set("n", "<CR>",  function()
+    vim.schedule(function() require("dcode.commands").open_input() end)
+  end, ko)
 end
 
---- Close the chat window (keeps buffer alive for next open).
 function M.close()
-  if chat_win and vim.api.nvim_win_is_valid(chat_win.win) then
-    vim.api.nvim_win_close(chat_win.win, true)
+  if win_valid() then
+    vim.api.nvim_win_close(chat_win, true)
   end
-  -- Keep chat_win.buf alive but mark win as closed
-  if chat_win then
-    chat_win = { buf = chat_win.buf, win = -1, lines = chat_win.lines }
-  end
+  chat_win = nil
+  -- Also close the input window if open
+  require("dcode.commands").close_input()
 end
 
---- Toggle the chat window.
----@param opts DcodeWindowOpts
 function M.toggle(opts)
-  if chat_win and vim.api.nvim_win_is_valid(chat_win.win) then
+  if win_valid() then
     M.close()
   else
     M.open(opts)
   end
 end
 
--- ─── Chat rendering ──────────────────────────────────────────────────────────
+-- ─── Chat rendering ───────────────────────────────────────────────────────────
 
-local separator = string.rep("─", 50)
+local SEP = string.rep("─", 52)
 
---- Render a user message in the chat buffer.
----@param text string
+--- Append a user message block.
+---@param text string  Display text (clean, no code context)
 function M.render_user(text)
-  local lines = {
-    "",
-    "▶ You",
-    separator,
-  }
-  for _, line in ipairs(vim.split(text, "\n", { plain = true })) do
-    table.insert(lines, line)
+  local lines = { "", "▶ You", SEP }
+  for _, l in ipairs(vim.split(text, "\n", { plain = true })) do
+    table.insert(lines, l)
   end
   table.insert(lines, "")
-  buf_append(lines)
+  buf_append_lines(lines)
 end
 
---- Begin an assistant reply block (before streaming starts).
+--- Begin assistant reply. Resets stream state. Starts spinner.
 function M.begin_assistant()
-  state.streaming = true
-  stream_buf = ""  -- reset on every new reply
-  local lines = {
-    "◀ dcode",
-    separator,
-    "",  -- streaming cursor line
-  }
-  buf_append(lines)
-  -- Remember where this reply starts so we can update it in-place
-  if chat_win and vim.api.nvim_buf_is_valid(chat_win.buf) then
-    state.stream_start_line = vim.api.nvim_buf_line_count(chat_win.buf)
+  -- Flush any orphaned stream buf from previous turn
+  if stream.buf ~= "" and buf_valid() then
+    with_modifiable(function()
+      vim.api.nvim_buf_set_text(chat_buf, stream.last_line, stream.last_col, stream.last_line, stream.last_col, { stream.buf })
+    end)
   end
+  stream.buf    = ""
+  stream.active = true
+
+  -- Append header + empty streaming line
+  buf_append_lines({ "◀ dcode", SEP, "" })
+
+  if buf_valid() then
+    local count = vim.api.nvim_buf_line_count(chat_buf)
+    -- The empty "" we just appended is 1-indexed = count, 0-indexed = count-1
+    stream.last_line = count - 1
+    stream.last_col  = 0
+  end
+
+  spinner_start()
 end
 
---- Accumulate text during streaming — updates the last line in-place.
-local stream_buf = ""
-function M.append_stream_text(chunk)
-  if not state.streaming then return end
-  stream_buf = stream_buf .. chunk
-  -- Split on newlines; the last element may be partial
-  local parts = vim.split(stream_buf, "\n", { plain = true })
-  if #parts > 1 then
-    -- Complete lines: append all but last
-    local complete = {}
-    for i = 1, #parts - 1 do
-      table.insert(complete, parts[i])
+--- Flush the pending stream update (called by throttle timer and on done).
+local function flush_stream()
+  if not stream.active or not buf_valid() then return end
+  with_modifiable(function()
+    local text = stream.buf
+    -- Split on newlines
+    local parts = vim.split(text, "\n", { plain = true })
+    if #parts == 1 then
+      -- Still on same line — replace from last_col to current end
+      local cur = vim.api.nvim_buf_get_lines(chat_buf, stream.last_line, stream.last_line + 1, false)[1] or ""
+      vim.api.nvim_buf_set_text(
+        chat_buf,
+        stream.last_line, 0,
+        stream.last_line, #cur,
+        { parts[1] }
+      )
+    else
+      -- Multiple lines: replace current line with first, append rest
+      local cur = vim.api.nvim_buf_get_lines(chat_buf, stream.last_line, stream.last_line + 1, false)[1] or ""
+      vim.api.nvim_buf_set_text(
+        chat_buf,
+        stream.last_line, 0,
+        stream.last_line, #cur,
+        parts
+      )
+      stream.last_line = stream.last_line + #parts - 1
+      stream.last_col  = #parts[#parts]
     end
-    stream_buf = parts[#parts]
-    buf_replace_tail(1, complete)
-    buf_append({ stream_buf })
-  else
-    buf_replace_tail(1, { stream_buf })
+  end)
+  -- Scroll if near bottom
+  if win_valid() then
+    local count   = vim.api.nvim_buf_line_count(chat_buf)
+    local cur_row = vim.api.nvim_win_get_cursor(chat_win)[1]
+    if cur_row >= count - 5 then
+      vim.api.nvim_win_set_cursor(chat_win, { count, 0 })
+    end
   end
+  stream.pending = false
 end
 
---- Append a tool-use notification line.
----@param tool_name string
----@param detail    string|nil
-function M.render_tool(tool_name, detail)
-  local line = "  ⚙ " .. tool_name
+--- Accumulate streaming text from SSE chunks (50ms throttle).
+---@param chunk string
+function M.append_stream_text(chunk)
+  if not stream.active then return end
+  stream.buf = stream.buf .. chunk
+  if stream.pending then return end
+  stream.pending = true
+  -- 50ms throttle — same as CopilotChat
+  if not stream.timer then
+    stream.timer = vim.loop.new_timer()
+  end
+  stream.timer:start(50, 0, vim.schedule_wrap(function()
+    flush_stream()
+  end))
+end
+
+--- Flush partial stream, then append a tool line.
+---@param name   string
+---@param detail string|nil
+function M.render_tool(name, detail)
+  flush_stream()
+  local line = "  ⚙ " .. name
   if detail and detail ~= "" then
     line = line .. " — " .. detail:sub(1, 60)
   end
-  buf_append({ line })
+  buf_append_lines({ line })
+  -- Reset stream anchor to new last line
+  if buf_valid() then
+    local count = vim.api.nvim_buf_line_count(chat_buf)
+    buf_append_lines({ "" })
+    stream.last_line = count  -- 0-indexed = count (since we just appended one empty)
+    stream.last_col  = 0
+    stream.buf = ""
+  end
 end
 
---- Append a thinking/reasoning line.
+--- Flush partial stream, then append a thinking line.
 ---@param text string
 function M.render_thinking(text)
-  buf_append({ "  ≋ " .. text:sub(1, 80) })
+  flush_stream()
+  buf_append_lines({ "  ≋ " .. text:sub(1, 100) })
+  if buf_valid() then
+    local count = vim.api.nvim_buf_line_count(chat_buf)
+    buf_append_lines({ "" })
+    stream.last_line = count
+    stream.last_col  = 0
+    stream.buf = ""
+  end
 end
 
---- Finish an assistant reply block.
+--- Finish assistant reply — flush buffer, stop spinner, append footer.
 ---@param cost   number|nil
----@param tokens table|nil  {input, output}
+---@param tokens table|nil  { input, output }
 function M.end_assistant(cost, tokens)
-  state.streaming = false
-  -- Flush any remaining stream buffer
-  if stream_buf ~= "" then
-    buf_replace_tail(1, { stream_buf })
-    stream_buf = ""
+  stream.active = false
+  spinner_stop()
+
+  -- Cancel throttle timer
+  if stream.timer then
+    stream.timer:stop()
+    stream.timer:close()
+    stream.timer = nil
   end
-  -- Append cost/token footer
-  if cost and cost > 0 or (tokens and (tokens.input or 0) > 0) then
-    local parts = {}
-    if tokens then
-      table.insert(parts, string.format("in: %d  out: %d", tokens.input or 0, tokens.output or 0))
-    end
+
+  -- Final flush
+  flush_stream()
+  stream.buf = ""
+
+  -- Footer
+  local footer = {}
+  if tokens and ((tokens.input or 0) > 0 or (tokens.output or 0) > 0) then
+    local s = string.format("  in:%d out:%d", tokens.input or 0, tokens.output or 0)
     if cost and cost > 0 then
-      table.insert(parts, string.format("$%.5f", cost))
+      s = s .. string.format("  $%.5f", cost)
     end
-    buf_append({ "  " .. table.concat(parts, "  ·  "), "" })
-  else
-    buf_append({ "" })
+    table.insert(footer, s)
   end
+  table.insert(footer, "")
+  buf_append_lines(footer)
 end
 
---- Show an error line in the chat buffer.
+--- Show error line in chat.
 ---@param msg string
 function M.render_error(msg)
-  state.streaming = false
-  stream_buf = ""
-  buf_append({ "", "✗ Error: " .. msg, "" })
+  stream.active = false
+  spinner_stop()
+  if stream.timer then stream.timer:stop(); stream.timer:close(); stream.timer = nil end
+  stream.buf = ""
+  buf_append_lines({ "", "  ✗ " .. msg, "" })
 end
 
---- Set the window title (updates session name).
+--- Update the floating window title.
 ---@param title string
 function M.set_title(title)
-  state.session_title = title
-  if chat_win and vim.api.nvim_win_is_valid(chat_win.win) then
-    -- Floating window: update config
-    pcall(vim.api.nvim_win_set_config, chat_win.win, {
+  if win_valid() then
+    pcall(vim.api.nvim_win_set_config, chat_win, {
       title     = " dcode — " .. title .. " ",
       title_pos = "center",
     })
   end
 end
 
---- Show a transient status notification (uses vim.notify).
----@param msg  string
----@param level integer  vim.log.levels.*
+--- vim.notify wrapper.
 function M.notify(msg, level)
   vim.notify("[dcode] " .. msg, level or vim.log.levels.INFO)
 end
 
---- Is the chat window currently open?
----@return boolean
 function M.is_open()
-  return chat_win ~= nil
-    and chat_win.win ~= -1
-    and vim.api.nvim_win_is_valid(chat_win.win)
+  return win_valid()
 end
 
---- Get the chat buffer number (for highlights etc.)
----@return integer|nil
 function M.bufnr()
-  return chat_win and chat_win.buf or nil
+  return chat_buf
+end
+
+--- Reset: clear buffer contents and session state (used by new_session).
+function M.reset()
+  stream.active = false
+  stream.buf    = ""
+  spinner_stop()
+  if buf_valid() then
+    with_modifiable(function()
+      vim.api.nvim_buf_set_lines(chat_buf, 0, -1, false, {
+        "  dcode chat — new session",
+        "",
+      })
+    end)
+    stream.last_line = 1
+    stream.last_col  = 0
+  end
 end
 
 return M

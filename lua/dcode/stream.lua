@@ -6,24 +6,29 @@ local ui     = require("dcode.ui")
 
 local M = {}
 
---- Run a prompt against the given session, streaming the response into the UI.
+--- Stream a prompt to the dcode server and render events into the chat UI.
 ---@param session_id   string
 ---@param message      string   Full message sent to API (may include code context)
----@param display_text string   Clean text shown in the chat UI (what the user typed)
----@param on_done      fun(err: string|nil)  called when stream ends
+---@param display_text string   Clean text shown in chat (what the user typed)
+---@param on_done      fun(err: string|nil)
 function M.run(session_id, message, display_text, on_done)
-  -- Show only the clean display text in the chat window
   ui.render_user(display_text or message)
   ui.begin_assistant()
 
   local total_cost   = 0.0
   local total_tokens = { input = 0, output = 0 }
+  local done_called  = false
+
+  local function finish(err)
+    if done_called then return end
+    done_called = true
+    if on_done then on_done(err) end
+  end
 
   client.stream(
     "/session/" .. session_id .. "/prompt",
     { message = message },
 
-    -- on_chunk: called for each SSE event
     function(event)
       local t = event.type
 
@@ -31,17 +36,14 @@ function M.run(session_id, message, display_text, on_done)
         ui.append_stream_text(event.content or "")
 
       elseif t == "thinking" then
-        -- Trim long reasoning lines
         local line = (event.content or ""):gsub("\n", " "):sub(1, 100)
-        if line ~= "" then
-          ui.render_thinking(line)
-        end
+        if line ~= "" then ui.render_thinking(line) end
 
       elseif t == "tool_start" then
         ui.render_tool(event.tool_name or "?", event.content)
 
       elseif t == "tool_end" then
-        -- nothing extra needed; tool_start already showed the name
+        -- no-op; tool_start already showed the name
 
       elseif t == "step_end" then
         if event.tokens then
@@ -53,29 +55,31 @@ function M.run(session_id, message, display_text, on_done)
         end
 
       elseif t == "retry" then
-        ui.notify("Retrying (attempt " .. (event.attempt or "?") .. "): " .. (event.content or ""), vim.log.levels.WARN)
+        ui.notify("Retrying (" .. (event.attempt or "?") .. "): " .. (event.content or ""), vim.log.levels.WARN)
 
       elseif t == "compaction" then
-        ui.notify("Context compacted: " .. (event.content or ""), vim.log.levels.INFO)
+        ui.notify("Context compacted", vim.log.levels.INFO)
 
       elseif t == "error" then
         ui.render_error(event.content or "unknown error")
-        if on_done then on_done(event.content) end
+        finish(event.content)
 
       elseif t == "done" then
         ui.end_assistant(total_cost, total_tokens)
-        if on_done then on_done(nil) end
+        finish(nil)
       end
     end,
 
-    -- on_done: called on TCP close / error
     function(err)
       if err then
         ui.render_error(err)
         ui.end_assistant(0, nil)
-        if on_done then on_done(err) end
+        finish(err)
+      else
+        -- TCP closed without a "done" event — treat as done
+        ui.end_assistant(total_cost, total_tokens)
+        finish(nil)
       end
-      -- If no error, the "done" event above already called on_done
     end
   )
 end

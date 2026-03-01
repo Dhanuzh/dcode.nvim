@@ -1,5 +1,7 @@
 -- lua/dcode/commands.lua
--- User-facing commands: ask, explain, fix, inline-edit, context injection.
+-- User-facing commands: ask, explain, fix, review, tests, docs.
+-- Input is handled via a small floating window above the chat window
+-- (no vim.ui.input — modelled after CopilotChat / avante prompt_input).
 
 local client  = require("dcode.client")
 local ui      = require("dcode.ui")
@@ -8,43 +10,166 @@ local stream  = require("dcode.stream")
 
 local M = {}
 
---- Ensure dcode serve is up and we have a session, then call cb(session_id).
---- Always creates a fresh session for the first prompt in this Neovim session.
+-- ─── Input window ────────────────────────────────────────────────────────────
+
+local input_win = nil  ---@type integer|nil
+local input_buf = nil  ---@type integer|nil
+local input_cb  = nil  ---@type fun(text: string)|nil  called on submit
+
+local function input_win_valid()
+  return input_win ~= nil and vim.api.nvim_win_is_valid(input_win)
+end
+
+--- Close the floating input window without submitting.
+function M.close_input()
+  if input_win_valid() then
+    vim.api.nvim_win_close(input_win, true)
+  end
+  input_win = nil
+  input_buf = nil
+  input_cb  = nil
+end
+
+--- Open a small floating input window.
+--- Pressing <CR> or <C-s> submits; <Esc> or <C-c> cancels.
+---@param prompt string   Label shown as the window title
+---@param prefill string  Pre-fill text
+---@param on_submit fun(text: string)
+local function open_input_win(prompt, prefill, on_submit)
+  if input_win_valid() then M.close_input() end
+
+  local chat_buf = ui.bufnr()
+
+  -- Determine position: below last line of chat win, or editor-relative
+  local row, col, width
+  local chat_win_id = nil
+  -- Find the chat window
+  for _, wid in ipairs(vim.api.nvim_list_wins()) do
+    if vim.api.nvim_win_get_buf(wid) == chat_buf then
+      chat_win_id = wid
+      break
+    end
+  end
+
+  if chat_win_id and vim.api.nvim_win_is_valid(chat_win_id) then
+    local winfo = vim.api.nvim_win_get_config(chat_win_id)
+    local pos   = vim.api.nvim_win_get_position(chat_win_id)
+    width = vim.api.nvim_win_get_width(chat_win_id)
+    local h   = vim.api.nvim_win_get_height(chat_win_id)
+    row = pos[1] + h - 3   -- 3 lines from bottom of chat win
+    col = pos[2]
+    if winfo.relative and winfo.relative ~= "" then
+      -- floating chat window: use same relative
+      row = winfo.row + winfo.height - 3
+      col = winfo.col
+    end
+  else
+    width = math.floor(vim.o.columns * 0.45)
+    row   = vim.o.lines - 5
+    col   = math.floor((vim.o.columns - width) / 2)
+  end
+
+  -- Clamp
+  row   = math.max(0, math.min(row, vim.o.lines - 5))
+  width = math.max(20, width)
+
+  input_buf = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_set_option_value("bufhidden",  "wipe",     { buf = input_buf })
+  vim.api.nvim_set_option_value("buftype",    "nofile",   { buf = input_buf })
+  vim.api.nvim_set_option_value("filetype",   "dcode-input", { buf = input_buf })
+
+  -- Pre-fill
+  if prefill and prefill ~= "" then
+    vim.api.nvim_buf_set_lines(input_buf, 0, -1, false, { prefill })
+  end
+
+  input_win = vim.api.nvim_open_win(input_buf, true, {
+    relative  = "editor",
+    width     = width - 2,
+    height    = 3,
+    row       = row,
+    col       = col + 1,
+    style     = "minimal",
+    border    = "rounded",
+    title     = " " .. prompt .. " ",
+    title_pos = "left",
+  })
+
+  vim.api.nvim_set_option_value("wrap",      true,  { win = input_win })
+  vim.api.nvim_set_option_value("winhighlight",
+    "Normal:Normal,FloatBorder:DcodeBorder", { win = input_win })
+
+  input_cb = on_submit
+
+  local function submit()
+    if not input_buf or not vim.api.nvim_buf_is_valid(input_buf) then return end
+    local lines = vim.api.nvim_buf_get_lines(input_buf, 0, -1, false)
+    local text  = vim.trim(table.concat(lines, "\n"))
+    M.close_input()
+    if text ~= "" and input_cb then
+      input_cb(text)
+    end
+  end
+
+  local ko = { buffer = input_buf, noremap = true, silent = true }
+  vim.keymap.set("i", "<CR>",  submit,          ko)
+  vim.keymap.set("i", "<C-s>", submit,          ko)
+  vim.keymap.set("n", "<CR>",  submit,          ko)
+  vim.keymap.set("n", "<C-s>", submit,          ko)
+  vim.keymap.set({ "n","i" }, "<Esc>",   function() M.close_input() end, ko)
+  vim.keymap.set({ "n","i" }, "<C-c>",   function() M.close_input() end, ko)
+
+  -- Auto-close if focus leaves the input window
+  vim.api.nvim_create_autocmd("WinLeave", {
+    buffer  = input_buf,
+    once    = true,
+    callback= function()
+      vim.schedule(function()
+        if input_win_valid() then M.close_input() end
+      end)
+    end,
+  })
+
+  -- Start in insert mode at end of line
+  vim.cmd("startinsert!")
+end
+
+-- ─── Session readiness ────────────────────────────────────────────────────────
+
+--- Ensure server up + session exists, then call cb(session_id).
+--- Resumes the most-recent session on first use per Neovim session;
+--- subsequent calls reuse the already-set current_id.
 ---@param cb fun(session_id: string)
 local function ensure_ready(cb)
   client.ping(function(alive)
     if not alive then
-      ui.notify(
-        "dcode server not running. Start it with: dcode serve",
-        vim.log.levels.ERROR
-      )
+      ui.notify("dcode server not running. Start it with: dcode serve", vim.log.levels.ERROR)
       return
     end
     if session.current_id then
       cb(session.current_id)
     else
-      -- Always create a new session — don't silently resume an old one
-      session.create(nil, function(ok, id)
+      -- Resume latest or create new
+      session.resume_or_create(nil, function(ok, id)
         if ok then cb(id) end
       end)
     end
   end)
 end
 
---- Build a context block from the current buffer (or visual selection).
----@param include_selection boolean  If true, use visual selection
----@return string  markdown-fenced context block
-local function get_context(include_selection)
+-- ─── Context builder ─────────────────────────────────────────────────────────
+
+---@param selection boolean  Use visual selection if true, else full buffer
+---@return string  fenced context block (empty string if nothing)
+local function get_context(selection)
   local lines
-  local ft = vim.bo.filetype or ""
+  local ft    = vim.bo.filetype or ""
   local fname = vim.fn.expand("%:.")
 
-  if include_selection then
-    -- Get the last visual selection
+  if selection then
     local s = vim.fn.getpos("'<")
     local e = vim.fn.getpos("'>")
     lines = vim.api.nvim_buf_get_lines(0, s[2] - 1, e[2], false)
-    -- Trim last line to column
     if lines[#lines] then
       lines[#lines] = lines[#lines]:sub(1, e[3])
     end
@@ -53,147 +178,92 @@ local function get_context(include_selection)
   end
 
   if #lines == 0 then return "" end
-
-  local code = table.concat(lines, "\n")
-  return string.format("```%s\n-- file: %s\n%s\n```", ft, fname, code)
+  return string.format("```%s\n-- file: %s\n%s\n```", ft, fname, table.concat(lines, "\n"))
 end
 
---- Show a vim.ui.input prompt, collect text, then stream to dcode.
---- Opens the chat window first if not already open.
----@param prefill string|nil   Pre-fill text for the input
-function M.prompt_input(prefill)
-  local cfg = require("dcode").config
-  if not ui.is_open() then
-    ui.open(cfg.window)
-  end
+-- ─── Core dispatch ────────────────────────────────────────────────────────────
 
-  vim.ui.input({ prompt = " dcode › ", default = prefill or "" }, function(input)
-    if not input or input == "" then return end
-    ensure_ready(function(session_id)
-      -- Display only the user's typed text, not the context blob
-      stream.run(session_id, input, input, function(err)
-        if err then
-          ui.notify("Stream error: " .. err, vim.log.levels.ERROR)
-        end
-      end)
+--- Send a prompt to dcode. Shows display_text in UI, sends full_msg to API.
+---@param full_msg    string
+---@param display_text string
+local function dispatch(full_msg, display_text)
+  local cfg = require("dcode").config
+  if not ui.is_open() then ui.open(cfg.window) end
+  ensure_ready(function(sid)
+    stream.run(sid, full_msg, display_text, function(err)
+      if err then ui.notify("Error: " .. err, vim.log.levels.ERROR) end
     end)
   end)
 end
 
---- Ask dcode something with the current buffer as context.
----@param prompt string|nil  If nil, ask via input prompt
+-- ─── Public commands ─────────────────────────────────────────────────────────
+
+--- Open the floating input window (bound to `i` in chat, and <leader>da).
+function M.open_input()
+  local cfg = require("dcode").config
+  if not ui.is_open() then ui.open(cfg.window) end
+  open_input_win("dcode  ask", "", function(text)
+    dispatch(text, text)
+  end)
+end
+
+--- Ask with the current buffer as additional context.
+---@param prompt string|nil  If nil, opens input window
 function M.ask(prompt)
   if prompt then
-    local ctx = get_context(false)
+    local ctx  = get_context(false)
     local full = ctx ~= "" and (ctx .. "\n\n" .. prompt) or prompt
-    local cfg = require("dcode").config
-    if not ui.is_open() then ui.open(cfg.window) end
-    ensure_ready(function(session_id)
-      stream.run(session_id, full, prompt, function(err)
-        if err then ui.notify("Error: " .. err, vim.log.levels.ERROR) end
-      end)
-    end)
+    dispatch(full, prompt)
   else
-    M.prompt_input()
+    M.open_input()
   end
 end
 
---- Ask dcode to explain the current visual selection.
+--- Ask with full file context (explicit label in UI).
+function M.context_ask()
+  open_input_win("dcode  full file", "", function(text)
+    local ctx  = get_context(false)
+    local full = ctx ~= "" and (ctx .. "\n\n" .. text) or text
+    local label = "[file] " .. text
+    dispatch(full, label)
+  end)
+end
+
 function M.explain()
   local ctx = get_context(true)
-  if ctx == "" then
-    ui.notify("Select some code first", vim.log.levels.WARN)
-    return
-  end
-  local prompt = ctx .. "\n\nExplain this code clearly and concisely."
-  local cfg = require("dcode").config
-  if not ui.is_open() then ui.open(cfg.window) end
-  ensure_ready(function(session_id)
-    stream.run(session_id, prompt, "Explain selection", function(err)
-      if err then ui.notify("Error: " .. err, vim.log.levels.ERROR) end
-    end)
-  end)
+  if ctx == "" then ui.notify("Select some code first", vim.log.levels.WARN); return end
+  dispatch(ctx .. "\n\nExplain this code clearly and concisely.", "Explain selection")
 end
 
---- Ask dcode to fix the current visual selection.
 function M.fix()
   local ctx = get_context(true)
-  if ctx == "" then
-    ui.notify("Select some code first", vim.log.levels.WARN)
-    return
-  end
-  local prompt = ctx .. "\n\nFix any bugs or issues in this code. Return only the corrected code."
-  local cfg = require("dcode").config
-  if not ui.is_open() then ui.open(cfg.window) end
-  ensure_ready(function(session_id)
-    stream.run(session_id, prompt, "Fix selection", function(err)
-      if err then ui.notify("Error: " .. err, vim.log.levels.ERROR) end
-    end)
-  end)
+  if ctx == "" then ui.notify("Select some code first", vim.log.levels.WARN); return end
+  dispatch(ctx .. "\n\nFix any bugs or issues. Return only the corrected code.", "Fix selection")
 end
 
---- Ask dcode to review the visual selection.
 function M.review()
   local ctx = get_context(true)
   if ctx == "" then ctx = get_context(false) end
-  local prompt = ctx .. "\n\nReview this code for correctness, performance, and style. Be specific."
-  local cfg = require("dcode").config
-  if not ui.is_open() then ui.open(cfg.window) end
-  ensure_ready(function(session_id)
-    stream.run(session_id, prompt, "Review code", function(err)
-      if err then ui.notify("Error: " .. err, vim.log.levels.ERROR) end
-    end)
-  end)
+  dispatch(ctx .. "\n\nReview for correctness, performance, and style. Be specific.", "Review code")
 end
 
---- Ask dcode to generate tests for the visual selection.
 function M.tests()
   local ctx = get_context(true)
   if ctx == "" then ctx = get_context(false) end
   local ft = vim.bo.filetype or ""
-  local prompt = ctx .. "\n\nWrite comprehensive unit tests for this code in " .. ft .. "."
-  local cfg = require("dcode").config
-  if not ui.is_open() then ui.open(cfg.window) end
-  ensure_ready(function(session_id)
-    stream.run(session_id, prompt, "Generate tests (" .. ft .. ")", function(err)
-      if err then ui.notify("Error: " .. err, vim.log.levels.ERROR) end
-    end)
-  end)
+  dispatch(ctx .. "\n\nWrite comprehensive unit tests in " .. ft .. ".", "Generate tests (" .. ft .. ")")
 end
 
---- Ask dcode to add inline documentation to the selection.
 function M.docs()
   local ctx = get_context(true)
   if ctx == "" then ctx = get_context(false) end
-  local prompt = ctx .. "\n\nAdd clear inline documentation/comments to this code."
-  local cfg = require("dcode").config
-  if not ui.is_open() then ui.open(cfg.window) end
-  ensure_ready(function(session_id)
-    stream.run(session_id, prompt, "Add docs", function(err)
-      if err then ui.notify("Error: " .. err, vim.log.levels.ERROR) end
-    end)
-  end)
+  dispatch(ctx .. "\n\nAdd clear inline documentation/comments.", "Add docs")
 end
 
---- Send entire current buffer as context with a custom prompt.
-function M.context_ask()
-  vim.ui.input({ prompt = " dcode (full file) › " }, function(input)
-    if not input or input == "" then return end
-    local ctx = get_context(false)
-    local full = ctx ~= "" and (ctx .. "\n\n" .. input) or input
-    local cfg = require("dcode").config
-    if not ui.is_open() then ui.open(cfg.window) end
-    ensure_ready(function(session_id)
-      stream.run(session_id, full, input, function(err)
-        if err then ui.notify("Error: " .. err, vim.log.levels.ERROR) end
-      end)
-    end)
-  end)
-end
-
---- Start a brand-new session.
+--- Start a brand-new session (clears chat, resets session ID).
 function M.new_session()
-  M.close_current_session()
+  session.current_id = nil
+  ui.reset()
   local cfg = require("dcode").config
   if not ui.is_open() then ui.open(cfg.window) end
   ensure_ready(function(_)
@@ -201,13 +271,7 @@ function M.new_session()
   end)
 end
 
---- Clear and reset the current session (fork a clean one).
-function M.close_current_session()
-  session.current_id = nil
-  ui.set_title("dcode")
-end
-
---- Fetch and display models from the running server.
+--- Show available models as a notification.
 function M.show_models()
   client.get("/model", function(ok, data)
     if not ok then
@@ -217,8 +281,8 @@ function M.show_models()
     local lines = { "Available models:", "" }
     if type(data) == "table" then
       for prov, info in pairs(data) do
-        local model_id = type(info) == "table" and (info.id or info.ID or "?") or tostring(info)
-        table.insert(lines, string.format("  %-22s %s", prov, model_id))
+        local mid = type(info) == "table" and (info.id or info.ID or "?") or tostring(info)
+        table.insert(lines, string.format("  %-22s %s", prov, mid))
       end
     end
     table.sort(lines)
@@ -226,7 +290,8 @@ function M.show_models()
   end)
 end
 
---- Register all :Dcode* user commands.
+-- ─── :Dcode* user commands ────────────────────────────────────────────────────
+
 function M.register()
   local function cmd(name, fn, desc, range)
     vim.api.nvim_create_user_command(name, fn, {
@@ -236,17 +301,17 @@ function M.register()
     })
   end
 
-  cmd("DcodeToggle",     function() require("dcode").toggle() end,             "Toggle dcode chat window")
-  cmd("DcodeAsk",        function(a) M.ask(a.args ~= "" and a.args or nil) end,"Ask dcode (with buffer context)")
-  cmd("DcodeExplain",    function() M.explain() end,                           "Explain selection",        true)
-  cmd("DcodeFix",        function() M.fix() end,                               "Fix selection",            true)
-  cmd("DcodeReview",     function() M.review() end,                            "Review code",              true)
-  cmd("DcodeTests",      function() M.tests() end,                             "Generate tests",           true)
-  cmd("DcodeDocs",       function() M.docs() end,                              "Add documentation",        true)
-  cmd("DcodeContext",    function() M.context_ask() end,                       "Ask with full file context")
-  cmd("DcodeNew",        function() M.new_session() end,                       "Start a new dcode session")
-  cmd("DcodeModels",     function() M.show_models() end,                       "List available models")
-  cmd("DcodeSessions",   function() require("dcode.telescope").sessions() end, "Browse sessions (Telescope)")
+  cmd("DcodeToggle",   function()          require("dcode").toggle() end,              "Toggle dcode chat window")
+  cmd("DcodeAsk",      function(a) M.ask(a.args ~= "" and a.args or nil) end,          "Ask dcode (buffer context)")
+  cmd("DcodeExplain",  function() M.explain() end,     "Explain selection",   true)
+  cmd("DcodeFix",      function() M.fix() end,         "Fix selection",       true)
+  cmd("DcodeReview",   function() M.review() end,      "Review code",         true)
+  cmd("DcodeTests",    function() M.tests() end,       "Generate tests",      true)
+  cmd("DcodeDocs",     function() M.docs() end,        "Add documentation",   true)
+  cmd("DcodeContext",  function() M.context_ask() end, "Ask with full file context")
+  cmd("DcodeNew",      function() M.new_session() end, "Start a new dcode session")
+  cmd("DcodeModels",   function() M.show_models() end, "List available models")
+  cmd("DcodeSessions", function() require("dcode.telescope").sessions() end, "Browse sessions")
 end
 
 return M
