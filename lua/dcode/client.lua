@@ -107,6 +107,15 @@ function M.request(method, path, payload, on_done)
   end)
 end
 
+-- ─── Debug logging (shared with ui.lua) ─────────────────────────────────────
+local _logfile = io.open("/tmp/dcode_debug.log", "a")
+local function dbg(...)
+  if _logfile then
+    _logfile:write(table.concat(vim.tbl_map(tostring, {...}), " ") .. "\n")
+    _logfile:flush()
+  end
+end
+
 --- Streaming request — calls on_chunk for every SSE "data:" line, on_done at end.
 ---@param path     string             e.g. "/session/abc123/prompt"
 ---@param payload  table              Request body
@@ -123,16 +132,22 @@ function M.stream(path, payload, on_chunk, on_done)
   local buf = ""
   local header_done = false
 
+  dbg("stream: connecting to", config.host, config.port, path)
+
   tcp:connect(config.host, config.port, function(err)
     if err then
+      dbg("stream: connect error:", err)
       vim.schedule(function()
         on_done("connect error: " .. err)
       end)
       return
     end
 
+    dbg("stream: connected")
+
     tcp:read_start(function(read_err, data)
       if read_err then
+        dbg("stream: read error:", read_err)
         tcp:close()
         vim.schedule(function()
           on_done("read error: " .. read_err)
@@ -141,6 +156,7 @@ function M.stream(path, payload, on_chunk, on_done)
       end
 
       if data then
+        dbg("stream: raw chunk len=", #data, "repr=", data:sub(1, 120):gsub("\r", "\\r"):gsub("\n", "\\n"))
         buf = buf .. data
 
         -- Skip HTTP headers on first pass
@@ -149,34 +165,48 @@ function M.stream(path, payload, on_chunk, on_done)
           if hdr_end then
             buf = buf:sub(hdr_end + 4)
             header_done = true
+            dbg("stream: headers done, SSE buf starts:", buf:sub(1, 80):gsub("\r", "\\r"):gsub("\n", "\\n"))
           else
+            dbg("stream: waiting for header end, buf so far len=", #buf)
             return
           end
         end
 
         -- Process complete SSE events (separated by blank line \n\n)
+        local iterations = 0
         while true do
+          iterations = iterations + 1
+          if iterations > 100 then dbg("stream: loop guard hit"); break end
+
           local event_end = buf:find("\n\n", 1, true)
+          dbg("stream: looking for \\n\\n in buf len=", #buf, "found=", tostring(event_end))
           if not event_end then break end
 
           local event_block = buf:sub(1, event_end - 1)
           buf = buf:sub(event_end + 2)
+          dbg("stream: event_block=", event_block:gsub("\r","\\r"):gsub("\n","\\n"), "remaining buf len=", #buf)
 
           -- Extract data: lines
           for line in event_block:gmatch("[^\n]+") do
             local payload_str = line:match("^data: (.+)$")
+            dbg("stream: line=", line:sub(1,60), "payload_str=", tostring(payload_str and payload_str:sub(1,60)))
             if payload_str then
               local ok, event = pcall(vim.fn.json_decode, payload_str)
+              dbg("stream: json_decode ok=", ok, "type=", ok and type(event) == "table" and event.type or "?")
               if ok and type(event) == "table" then
                 vim.schedule(function()
+                  dbg("stream: dispatching event type=", event.type)
                   on_chunk(event)
                 end)
+              else
+                dbg("stream: json_decode failed:", tostring(event))
               end
             end
           end
         end
       else
         -- EOF
+        dbg("stream: EOF")
         tcp:close()
         vim.schedule(function()
           on_done(nil)
