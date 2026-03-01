@@ -7,12 +7,13 @@ local ui     = require("dcode.ui")
 local M = {}
 
 --- Run a prompt against the given session, streaming the response into the UI.
----@param session_id string
----@param message    string
----@param on_done    fun(err: string|nil)  called when stream ends
-function M.run(session_id, message, on_done)
-  -- Show the user's message immediately
-  ui.render_user(message)
+---@param session_id   string
+---@param message      string   Full message sent to API (may include code context)
+---@param display_text string   Clean text shown in the chat UI (what the user typed)
+---@param on_done      fun(err: string|nil)  called when stream ends
+function M.run(session_id, message, display_text, on_done)
+  -- Show only the clean display text in the chat window
+  ui.render_user(display_text or message)
   ui.begin_assistant()
 
   local total_cost   = 0.0

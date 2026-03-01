@@ -9,6 +9,7 @@ local stream  = require("dcode.stream")
 local M = {}
 
 --- Ensure dcode serve is up and we have a session, then call cb(session_id).
+--- Always creates a fresh session for the first prompt in this Neovim session.
 ---@param cb fun(session_id: string)
 local function ensure_ready(cb)
   client.ping(function(alive)
@@ -22,7 +23,8 @@ local function ensure_ready(cb)
     if session.current_id then
       cb(session.current_id)
     else
-      session.resume_or_create(nil, function(ok, id)
+      -- Always create a new session — don't silently resume an old one
+      session.create(nil, function(ok, id)
         if ok then cb(id) end
       end)
     end
@@ -68,7 +70,8 @@ function M.prompt_input(prefill)
   vim.ui.input({ prompt = " dcode › ", default = prefill or "" }, function(input)
     if not input or input == "" then return end
     ensure_ready(function(session_id)
-      stream.run(session_id, input, function(err)
+      -- Display only the user's typed text, not the context blob
+      stream.run(session_id, input, input, function(err)
         if err then
           ui.notify("Stream error: " .. err, vim.log.levels.ERROR)
         end
@@ -86,7 +89,7 @@ function M.ask(prompt)
     local cfg = require("dcode").config
     if not ui.is_open() then ui.open(cfg.window) end
     ensure_ready(function(session_id)
-      stream.run(session_id, full, function(err)
+      stream.run(session_id, full, prompt, function(err)
         if err then ui.notify("Error: " .. err, vim.log.levels.ERROR) end
       end)
     end)
@@ -106,7 +109,7 @@ function M.explain()
   local cfg = require("dcode").config
   if not ui.is_open() then ui.open(cfg.window) end
   ensure_ready(function(session_id)
-    stream.run(session_id, prompt, function(err)
+    stream.run(session_id, prompt, "Explain selection", function(err)
       if err then ui.notify("Error: " .. err, vim.log.levels.ERROR) end
     end)
   end)
@@ -123,7 +126,7 @@ function M.fix()
   local cfg = require("dcode").config
   if not ui.is_open() then ui.open(cfg.window) end
   ensure_ready(function(session_id)
-    stream.run(session_id, prompt, function(err)
+    stream.run(session_id, prompt, "Fix selection", function(err)
       if err then ui.notify("Error: " .. err, vim.log.levels.ERROR) end
     end)
   end)
@@ -137,7 +140,7 @@ function M.review()
   local cfg = require("dcode").config
   if not ui.is_open() then ui.open(cfg.window) end
   ensure_ready(function(session_id)
-    stream.run(session_id, prompt, function(err)
+    stream.run(session_id, prompt, "Review code", function(err)
       if err then ui.notify("Error: " .. err, vim.log.levels.ERROR) end
     end)
   end)
@@ -152,7 +155,7 @@ function M.tests()
   local cfg = require("dcode").config
   if not ui.is_open() then ui.open(cfg.window) end
   ensure_ready(function(session_id)
-    stream.run(session_id, prompt, function(err)
+    stream.run(session_id, prompt, "Generate tests (" .. ft .. ")", function(err)
       if err then ui.notify("Error: " .. err, vim.log.levels.ERROR) end
     end)
   end)
@@ -166,7 +169,7 @@ function M.docs()
   local cfg = require("dcode").config
   if not ui.is_open() then ui.open(cfg.window) end
   ensure_ready(function(session_id)
-    stream.run(session_id, prompt, function(err)
+    stream.run(session_id, prompt, "Add docs", function(err)
       if err then ui.notify("Error: " .. err, vim.log.levels.ERROR) end
     end)
   end)
@@ -181,7 +184,7 @@ function M.context_ask()
     local cfg = require("dcode").config
     if not ui.is_open() then ui.open(cfg.window) end
     ensure_ready(function(session_id)
-      stream.run(session_id, full, function(err)
+      stream.run(session_id, full, input, function(err)
         if err then ui.notify("Error: " .. err, vim.log.levels.ERROR) end
       end)
     end)

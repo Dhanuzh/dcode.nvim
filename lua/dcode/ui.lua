@@ -32,6 +32,8 @@ function M.setup_highlights()
   hi(hl.separator, { fg = "#3b4261" })
   hi(hl.status_ok, { fg = "#9ece6a" })
   hi(hl.status_err,{ fg = "#f7768e" })
+  -- Suppress markdown code-fence background highlight bleed in the chat window
+  -- (set via winhighlight per-window in open())
 end
 
 -- ─── State ───────────────────────────────────────────────────────────────────
@@ -121,11 +123,22 @@ function M.open(opts)
     return
   end
 
-  -- Create buffer
-  local buf = vim.api.nvim_create_buf(false, true)
-  buf_set(buf, "filetype", "markdown")
-  buf_set(buf, "modifiable", false)
-  buf_set(buf, "bufhidden", "hide")
+  -- Re-use existing buffer if valid, otherwise create fresh
+  local buf
+  if chat_win and vim.api.nvim_buf_is_valid(chat_win.buf) then
+    buf = chat_win.buf
+    -- Clear stale content from previous session
+    buf_set(buf, "modifiable", true)
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, {})
+    buf_set(buf, "modifiable", false)
+  else
+    buf = vim.api.nvim_create_buf(false, true)
+    -- Use plain text — not markdown — to avoid syntax hl painting
+    -- code-fence backgrounds (the teal bleed in the screenshot)
+    buf_set(buf, "filetype", "")
+    buf_set(buf, "modifiable", false)
+    buf_set(buf, "bufhidden", "hide")
+  end
 
   local win
   if style == "float" then
@@ -166,9 +179,15 @@ function M.open(opts)
   win_set(win, "number", false)
   win_set(win, "signcolumn", "no")
   win_set(win, "cursorline", false)
-  win_set(win, "winhighlight", "Normal:Normal,FloatBorder:" .. hl.border)
+  -- Suppress ALL syntax-driven bg highlights inside the chat window:
+  -- Normal, NormalFloat, Search, Visual, CursorLine all map to plain Normal
+  win_set(win, "winhighlight",
+    "Normal:Normal,NormalFloat:Normal,FloatBorder:" .. hl.border ..
+    ",Search:Normal,IncSearch:Normal,Visual:Visual,CursorLine:Normal" ..
+    ",markdownCode:Normal,markdownCodeBlock:Normal"
+  )
 
-  -- Close keymaps inside the chat window
+  -- Close / input keymaps inside the chat window
   local kopts = { buffer = buf, noremap = true, silent = true }
   vim.keymap.set("n", "q",     function() M.close() end, kopts)
   vim.keymap.set("n", "<Esc>", function() M.close() end, kopts)
@@ -182,23 +201,24 @@ function M.open(opts)
   -- Show welcome header
   buf_set(buf, "modifiable", true)
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, {
-    "╭─────────────────────────────────────────╮",
-    "│              dcode chat                 │",
-    "│   Press <i> or <leader>da to ask       │",
-    "│   Press q or <Esc> to close            │",
-    "│   Press <leader>ds for sessions        │",
-    "╰─────────────────────────────────────────╯",
+    "  dcode chat",
+    "  Press i or <leader>da to ask",
+    "  Press q / <Esc> to close",
+    "  Press <leader>ds to browse sessions",
     "",
   })
   buf_set(buf, "modifiable", false)
 end
 
---- Close the chat window.
+--- Close the chat window (keeps buffer alive for next open).
 function M.close()
   if chat_win and vim.api.nvim_win_is_valid(chat_win.win) then
     vim.api.nvim_win_close(chat_win.win, true)
   end
-  chat_win = nil
+  -- Keep chat_win.buf alive but mark win as closed
+  if chat_win then
+    chat_win = { buf = chat_win.buf, win = -1, lines = chat_win.lines }
+  end
 end
 
 --- Toggle the chat window.
@@ -233,6 +253,7 @@ end
 --- Begin an assistant reply block (before streaming starts).
 function M.begin_assistant()
   state.streaming = true
+  stream_buf = ""  -- reset on every new reply
   local lines = {
     "◀ dcode",
     separator,
@@ -339,7 +360,9 @@ end
 --- Is the chat window currently open?
 ---@return boolean
 function M.is_open()
-  return chat_win ~= nil and vim.api.nvim_win_is_valid(chat_win.win)
+  return chat_win ~= nil
+    and chat_win.win ~= -1
+    and vim.api.nvim_win_is_valid(chat_win.win)
 end
 
 --- Get the chat buffer number (for highlights etc.)
