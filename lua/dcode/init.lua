@@ -108,9 +108,28 @@ end
 
 -- ─── Public API ───────────────────────────────────────────────────────────────
 
-function M.open()  require("dcode.ui").open(M.config.window) end
-function M.close() require("dcode.ui").close() end
-function M.toggle() require("dcode.ui").toggle(M.config.window) end
+function M.open()
+  local was_open = require("dcode.ui").is_open()
+  require("dcode.ui").open(M.config.window)
+  -- Auto-open the input pane on first open
+  if not was_open then
+    vim.schedule(function()
+      require("dcode.commands").after_open()
+    end)
+  end
+end
+
+function M.close()
+  require("dcode.ui").close()
+end
+
+function M.toggle()
+  if require("dcode.ui").is_open() then
+    require("dcode.ui").close()
+  else
+    M.open()
+  end
+end
 
 ---@param message string
 function M.ask(message)

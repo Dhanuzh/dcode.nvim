@@ -17,7 +17,7 @@ function M.create(opts, cb)
   client.post("/session", payload, function(ok, data)
     if ok and type(data) == "table" and data.id then
       M.current_id = data.id
-      ui.set_title(data.title or data.id)
+      ui.set_session_info(data.agent, data.model, data.title)
       ui.notify("Session created: " .. data.id, vim.log.levels.INFO)
       if cb then cb(true, data.id) end
     else
@@ -34,11 +34,10 @@ end
 function M.resume_or_create(opts, cb)
   client.get("/session", function(ok, data)
     if ok and type(data) == "table" and #data > 0 then
-      -- Sessions are returned newest-first
       local latest = data[1]
       M.current_id = latest.id
-      ui.set_title(latest.title or latest.id)
-      ui.notify("Resumed session: " .. latest.id, vim.log.levels.INFO)
+      ui.set_session_info(latest.agent, latest.model, latest.title)
+      ui.notify("Resumed: " .. (latest.title or latest.id), vim.log.levels.INFO)
       if cb then cb(true, latest.id) end
     else
       M.create(opts, cb)
@@ -66,7 +65,7 @@ function M.delete(session_id, cb)
     if ok then
       if M.current_id == session_id then
         M.current_id = nil
-        ui.set_title("dcode")
+        ui.set_session_info(nil, nil, "dcode")
       end
       ui.notify("Session deleted: " .. session_id, vim.log.levels.INFO)
     else
@@ -87,7 +86,7 @@ function M.fork(cb)
   client.post("/session/" .. M.current_id .. "/fork", {}, function(ok, data)
     if ok and type(data) == "table" and data.id then
       M.current_id = data.id
-      ui.set_title((data.title or data.id) .. " (fork)")
+      ui.set_session_info(data.agent, data.model, (data.title or data.id) .. " (fork)")
       ui.notify("Forked → " .. data.id, vim.log.levels.INFO)
       if cb then cb(true, data.id) end
     else
