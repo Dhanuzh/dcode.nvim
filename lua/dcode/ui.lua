@@ -4,6 +4,15 @@
 
 local M = {}
 
+-- ─── Debug logging ───────────────────────────────────────────────────────────
+local _logfile = io.open("/tmp/dcode_debug.log", "a")
+local function dbg(...)
+  if _logfile then
+    _logfile:write(table.concat(vim.tbl_map(tostring, {...}), " ") .. "\n")
+    _logfile:flush()
+  end
+end
+
 -- ─── Highlights ──────────────────────────────────────────────────────────────
 
 function M.setup_highlights()
@@ -29,19 +38,18 @@ local ns_agent  = vim.api.nvim_create_namespace("dcode_agent")
 
 -- ─── State ───────────────────────────────────────────────────────────────────
 
-local chat_buf   = nil  ---@type integer|nil
-local result_win = nil  ---@type integer|nil
-local input_win  = nil  ---@type integer|nil
+local chat_buf   = nil
+local result_win = nil
+local input_win  = nil
 
 local current_agent = "coder"
 local current_model = ""
 local current_title = ""
 
--- Streaming — simple accumulate-then-write model
 local stream = {
   active  = false,
-  buf     = "",   -- text accumulated since last flush
-  row     = 0,    -- 0-based line where the next write begins
+  buf     = "",
+  row     = 0,
   pending = false,
 }
 
@@ -58,11 +66,12 @@ local function rwin_ok() return result_win ~= nil and vim.api.nvim_win_is_valid(
 -- ─── Write helpers ───────────────────────────────────────────────────────────
 
 local function with_mod(fn)
-  if not buf_ok() then return end
-  vim.api.nvim_set_option_value("modifiable", true,  { buf = chat_buf })
-  local ok, err = pcall(fn)
-  vim.api.nvim_set_option_value("modifiable", false, { buf = chat_buf })
-  if not ok then vim.notify("[dcode] " .. tostring(err), vim.log.levels.ERROR) end
+  if not buf_ok() then dbg("with_mod: buf_ok() false"); return end
+  local ok1, err1 = pcall(vim.api.nvim_set_option_value, "modifiable", true, { buf = chat_buf })
+  if not ok1 then dbg("with_mod: set modifiable=true failed:", err1); return end
+  local ok2, err2 = pcall(fn)
+  pcall(vim.api.nvim_set_option_value, "modifiable", false, { buf = chat_buf })
+  if not ok2 then dbg("with_mod: fn failed:", err2); vim.notify("[dcode] " .. tostring(err2), vim.log.levels.ERROR) end
 end
 
 local function append(lines)
@@ -114,25 +123,19 @@ local function spin_start()
   end))
 end
 
--- ─── Agent bar (extmarks on line 0) ──────────────────────────────────────────
+-- ─── Agent bar ───────────────────────────────────────────────────────────────
 
 local AGENTS = { "coder", "planner", "explorer" }
 
---- Redraw the agent selector bar on line 0 of the chat buffer using extmarks.
 local function redraw_agent_bar()
   if not buf_ok() then return end
   vim.api.nvim_buf_clear_namespace(chat_buf, ns_agent, 0, 1)
-
-  -- Build virt_text chunks: each agent with a space separator
   local chunks = {}
   for i, a in ipairs(AGENTS) do
     local hl = (a == current_agent) and "DcodeAgentSel" or "DcodeAgentOff"
     table.insert(chunks, { " " .. a .. " ", hl })
-    if i < #AGENTS then
-      table.insert(chunks, { "  ", "DcodeAgentOff" })
-    end
+    if i < #AGENTS then table.insert(chunks, { "  ", "DcodeAgentOff" }) end
   end
-  -- Show on line 0 as a virtual line ABOVE the content
   vim.api.nvim_buf_set_extmark(chat_buf, ns_agent, 0, 0, {
     virt_lines       = { chunks },
     virt_lines_above = true,
@@ -193,7 +196,7 @@ function M.update_statuslines()
   end
 end
 
--- ─── Public: update session / agent metadata ─────────────────────────────────
+-- ─── Public: metadata ────────────────────────────────────────────────────────
 
 function M.set_session_info(agent, model, title)
   if agent and agent ~= "" then current_agent = agent end
@@ -216,13 +219,9 @@ end
 
 -- ─── Sidebar open / close / toggle ───────────────────────────────────────────
 
----@param opts table  { width?: number }
 function M.open(opts)
   opts = opts or {}
-  if rwin_ok() then
-    vim.api.nvim_set_current_win(result_win)
-    return
-  end
+  if rwin_ok() then vim.api.nvim_set_current_win(result_win); return end
 
   ensure_buf()
 
@@ -231,31 +230,21 @@ function M.open(opts)
   sw = math.max(sw, 32)
 
   local orig = vim.api.nvim_get_current_win()
-
   vim.cmd("vsplit")
   result_win = vim.api.nvim_get_current_win()
   vim.api.nvim_win_set_buf(result_win, chat_buf)
   vim.cmd("wincmd L")
   vim.api.nvim_win_set_width(result_win, sw)
-
   win_opts(result_win)
   vim.api.nvim_set_option_value("statusline", result_sl(), { win = result_win })
-
   scroll_bottom()
 
-  -- Keymaps in result pane
   local ko = { buffer = chat_buf, noremap = true, silent = true }
   vim.keymap.set("n", "q",     function() M.close() end, ko)
   vim.keymap.set("n", "<Esc>", function() M.close() end, ko)
-  vim.keymap.set("n", "i",     function()
-    vim.schedule(function() require("dcode.commands").focus_or_open_input() end)
-  end, ko)
-  vim.keymap.set("n", "<CR>", function()
-    vim.schedule(function() require("dcode.commands").focus_or_open_input() end)
-  end, ko)
-  vim.keymap.set("n", "<Tab>", function()
-    vim.schedule(function() require("dcode.commands").cycle_agent() end)
-  end, ko)
+  vim.keymap.set("n", "i",  function() vim.schedule(function() require("dcode.commands").focus_or_open_input() end) end, ko)
+  vim.keymap.set("n", "<CR>", function() vim.schedule(function() require("dcode.commands").focus_or_open_input() end) end, ko)
+  vim.keymap.set("n", "<Tab>", function() vim.schedule(function() require("dcode.commands").cycle_agent() end) end, ko)
 
   vim.api.nvim_set_current_win(orig)
 end
@@ -272,9 +261,7 @@ function M.close()
     pcall(vim.api.nvim_win_close, input_win, true)
   end
   input_win = nil
-  if rwin_ok() then
-    pcall(vim.api.nvim_win_close, result_win, true)
-  end
+  if rwin_ok() then pcall(vim.api.nvim_win_close, result_win, true) end
   result_win = nil
 end
 
@@ -302,69 +289,71 @@ end
 function M.begin_assistant()
   stream.buf    = ""
   stream.active = true
+  stream.pending = false
 
   append({ "◀ dcode", SEP, "" })
 
   if buf_ok() then
-    -- stream.row is 0-based. The empty "" line we just appended is the last line.
-    stream.row = vim.api.nvim_buf_line_count(chat_buf) - 1
+    local n    = vim.api.nvim_buf_line_count(chat_buf)
+    stream.row = n - 1  -- 0-based index of the blank line we just appended
+    dbg("begin_assistant: stream.row =", stream.row, "buf lines =", n)
   end
 
   spin_start()
 end
 
--- ─── Flush: write stream.buf to buffer from stream.row; reset buf ────────────
--- Called from the 50ms throttle timer AND directly from end_assistant/render_tool.
--- IMPORTANT: does NOT check stream.active — callers manage that.
+-- ─── Core flush ──────────────────────────────────────────────────────────────
+-- Writes stream.buf to the buffer starting at stream.row.
+-- Resets stream.buf="" and advances stream.row. Does NOT check stream.active.
 
 local function do_flush()
-  if not buf_ok() then return end
+  dbg("do_flush called: buf_ok=", buf_ok(), "stream.buf=|"..stream.buf.."|", "stream.row=", stream.row, "active=", stream.active)
+  if not buf_ok() then stream.pending = false; return end
   if stream.buf == "" then stream.pending = false; return end
 
+  local text = stream.buf
+  stream.buf = ""  -- reset immediately so re-entrant calls see empty buf
+
   with_mod(function()
-    local text  = stream.buf
-    stream.buf  = ""   -- reset BEFORE the write (re-entrancy safe)
-
     local parts = vim.split(text, "\n", { plain = true })
+    dbg("do_flush: parts=", vim.inspect(parts), "stream.row=", stream.row)
 
-    -- Ensure enough lines exist in the buffer
+    -- Ensure buffer has enough lines
     local n = vim.api.nvim_buf_line_count(chat_buf)
-    local needed = stream.row + #parts  -- we need indices stream.row .. stream.row+#parts-1
-    while n < needed do
+    local need = stream.row + #parts  -- need lines 0..stream.row+#parts-1
+    dbg("do_flush: n=", n, "need=", need)
+    while n < need do
       vim.api.nvim_buf_set_lines(chat_buf, n, n, false, { "" })
       n = n + 1
     end
 
-    -- Write each part to its line
+    -- Write each part
     for i, part in ipairs(parts) do
-      local lnum = stream.row + i - 1  -- 0-based
+      local lnum = stream.row + i - 1
+      dbg("do_flush: writing line", lnum, "|"..part.."|")
       vim.api.nvim_buf_set_lines(chat_buf, lnum, lnum + 1, false, { part })
     end
 
-    -- Advance stream.row to the line of the last part written.
-    -- If text ended with \n, parts[#parts]=="" and the next write should go
-    -- on that last (empty) line. Either way, row = row + #parts - 1.
     stream.row = stream.row + #parts - 1
+    dbg("do_flush: new stream.row =", stream.row)
   end)
 
   -- Auto-scroll
   if rwin_ok() then
     local n   = vim.api.nvim_buf_line_count(chat_buf)
     local cur = vim.api.nvim_win_get_cursor(result_win)[1]
-    if cur >= n - 5 then
-      vim.api.nvim_win_set_cursor(result_win, { n, 0 })
-    end
+    if cur >= n - 5 then vim.api.nvim_win_set_cursor(result_win, { n, 0 }) end
   end
 
   stream.pending = false
 end
 
 function M.append_stream_text(chunk)
+  dbg("append_stream_text: active=", stream.active, "chunk=|"..chunk.."|")
   if not stream.active then return end
   stream.buf = stream.buf .. chunk
   if stream.pending then return end
   stream.pending = true
-  -- Always create a fresh one-shot timer (never reuse a closed handle)
   local t = vim.loop.new_timer()
   t:start(50, 0, vim.schedule_wrap(function()
     t:close()
@@ -373,7 +362,7 @@ function M.append_stream_text(chunk)
 end
 
 function M.render_tool(name, detail)
-  do_flush()  -- flush any partial text first
+  do_flush()
   local line = "  ⚙ " .. name
   if detail and detail ~= "" then line = line .. " — " .. detail:sub(1, 60) end
   append({ line, "" })
@@ -393,13 +382,12 @@ function M.render_thinking(text)
 end
 
 function M.end_assistant(cost, tokens)
-  -- Stop spinner first
+  dbg("end_assistant called: stream.buf=|"..stream.buf.."|", "active=", stream.active)
   spin_stop()
-
-  -- Final flush — do NOT guard on stream.active here
-  do_flush()
+  do_flush()           -- flush BEFORE setting active=false
   stream.active = false
   stream.buf    = ""
+  stream.pending = false
 
   local footer = {}
   if tokens and ((tokens.input or 0) > 0 or (tokens.output or 0) > 0) then
@@ -410,6 +398,7 @@ function M.end_assistant(cost, tokens)
   table.insert(footer, "")
   append(footer)
   scroll_bottom()
+  dbg("end_assistant done")
 end
 
 function M.render_error(msg)
@@ -426,8 +415,9 @@ function M.notify(msg, level)
 end
 
 function M.reset()
-  stream.active = false
-  stream.buf    = ""
+  stream.active  = false
+  stream.buf     = ""
+  stream.pending = false
   spin_stop()
   if buf_ok() then
     with_mod(function()
