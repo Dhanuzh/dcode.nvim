@@ -1,7 +1,7 @@
 -- lua/dcode/commands.lua
 -- User-facing commands: ask, explain, fix, review, tests, docs.
--- Input is handled via a small floating window above the chat window
--- (no vim.ui.input — modelled after CopilotChat / avante prompt_input).
+-- Input is an embedded horizontal split BELOW the result window
+-- (avante-style sidebar: no floating input window).
 
 local client  = require("dcode.client")
 local ui      = require("dcode.ui")
@@ -10,135 +10,158 @@ local stream  = require("dcode.stream")
 
 local M = {}
 
--- ─── Input window ────────────────────────────────────────────────────────────
+-- ─── Input pane ──────────────────────────────────────────────────────────────
+-- The input pane is a 3-line horizontal split opened below the result window.
+-- It is persistent while the sidebar is open; pressing <Esc> unfocuses it
+-- (returns to result window) but does NOT close it.
 
 local input_win = nil  ---@type integer|nil
 local input_buf = nil  ---@type integer|nil
-local input_cb  = nil  ---@type fun(text: string)|nil  called on submit
+-- Callback invoked on submit (captures current command's context):
+local input_cb  = nil  ---@type fun(text: string)|nil
 
 local function input_win_valid()
   return input_win ~= nil and vim.api.nvim_win_is_valid(input_win)
 end
 
---- Close the floating input window without submitting.
-function M.close_input()
-  if input_win_valid() then
-    vim.api.nvim_win_close(input_win, true)
-  end
-  input_win = nil
-  input_buf = nil
-  input_cb  = nil
+local function input_buf_valid()
+  return input_buf ~= nil and vim.api.nvim_buf_is_valid(input_buf)
 end
 
---- Open a small floating input window.
---- Pressing <CR> or <C-s> submits; <Esc> or <C-c> cancels.
----@param prompt string   Label shown as the window title
----@param prefill string  Pre-fill text
----@param on_submit fun(text: string)
-local function open_input_win(prompt, prefill, on_submit)
-  if input_win_valid() then M.close_input() end
-
-  local chat_buf = ui.bufnr()
-
-  -- Determine position: below last line of chat win, or editor-relative
-  local row, col, width
-  local chat_win_id = nil
-  -- Find the chat window
-  for _, wid in ipairs(vim.api.nvim_list_wins()) do
-    if vim.api.nvim_win_get_buf(wid) == chat_buf then
-      chat_win_id = wid
-      break
-    end
+--- Close both panes of the input window and clear state.
+function M.close_input()
+  if input_win_valid() then
+    pcall(vim.api.nvim_win_close, input_win, true)
   end
-
-  if chat_win_id and vim.api.nvim_win_is_valid(chat_win_id) then
-    local winfo = vim.api.nvim_win_get_config(chat_win_id)
-    local pos   = vim.api.nvim_win_get_position(chat_win_id)
-    width = vim.api.nvim_win_get_width(chat_win_id)
-    local h   = vim.api.nvim_win_get_height(chat_win_id)
-    row = pos[1] + h - 3   -- 3 lines from bottom of chat win
-    col = pos[2]
-    if winfo.relative and winfo.relative ~= "" then
-      -- floating chat window: use same relative
-      row = winfo.row + winfo.height - 3
-      col = winfo.col
-    end
-  else
-    width = math.floor(vim.o.columns * 0.45)
-    row   = vim.o.lines - 5
-    col   = math.floor((vim.o.columns - width) / 2)
+  input_win = nil
+  -- Keep the buffer alive in case we reopen — wipe it below explicitly.
+  if input_buf_valid() then
+    pcall(vim.api.nvim_buf_delete, input_buf, { force = true })
   end
+  input_buf = nil
+  input_cb  = nil
+  ui.set_input_win(nil)
+end
 
-  -- Clamp
-  row   = math.max(0, math.min(row, vim.o.lines - 5))
-  width = math.max(20, width)
-
+--- Create (or reuse) the input buffer.
+local function ensure_input_buf()
+  if input_buf_valid() then return end
   input_buf = vim.api.nvim_create_buf(false, true)
-  vim.api.nvim_set_option_value("bufhidden",  "wipe",     { buf = input_buf })
-  vim.api.nvim_set_option_value("buftype",    "nofile",   { buf = input_buf })
+  vim.api.nvim_set_option_value("bufhidden",  "hide",        { buf = input_buf })
+  vim.api.nvim_set_option_value("buftype",    "nofile",      { buf = input_buf })
   vim.api.nvim_set_option_value("filetype",   "dcode-input", { buf = input_buf })
+  vim.api.nvim_set_option_value("modifiable", true,          { buf = input_buf })
+end
 
-  -- Pre-fill
-  if prefill and prefill ~= "" then
-    vim.api.nvim_buf_set_lines(input_buf, 0, -1, false, { prefill })
-  end
-
-  input_win = vim.api.nvim_open_win(input_buf, true, {
-    relative  = "editor",
-    width     = width - 2,
-    height    = 3,
-    row       = row,
-    col       = col + 1,
-    style     = "minimal",
-    border    = "rounded",
-    title     = " " .. prompt .. " ",
-    title_pos = "left",
-  })
-
-  vim.api.nvim_set_option_value("wrap",      true,  { win = input_win })
-  vim.api.nvim_set_option_value("winhighlight",
-    "Normal:Normal,FloatBorder:DcodeBorder", { win = input_win })
+--- Open the embedded input pane below the result window.
+--- Idempotent: if already open, just focuses it and sets cb.
+---@param on_submit fun(text: string)
+---@param prefill   string|nil
+local function open_input_pane(on_submit, prefill)
+  local rwin = ui.result_winid()
+  if not rwin then return end  -- sidebar not open
 
   input_cb = on_submit
 
+  -- If pane already exists just focus it
+  if input_win_valid() then
+    -- Clear old content, set new prefill
+    if input_buf_valid() then
+      vim.api.nvim_buf_set_lines(input_buf, 0, -1, false, { prefill or "" })
+    end
+    vim.api.nvim_set_current_win(input_win)
+    vim.cmd("startinsert!")
+    return
+  end
+
+  ensure_input_buf()
+
+  -- Prefill
+  if prefill and prefill ~= "" then
+    vim.api.nvim_buf_set_lines(input_buf, 0, -1, false, { prefill })
+  else
+    vim.api.nvim_buf_set_lines(input_buf, 0, -1, false, { "" })
+  end
+
+  -- Open a horizontal split below the result window
+  vim.api.nvim_set_current_win(rwin)
+  vim.cmd("belowright 3split")
+  input_win = vim.api.nvim_get_current_win()
+  vim.api.nvim_win_set_buf(input_win, input_buf)
+
+  -- Window options
+  vim.api.nvim_set_option_value("wrap",       true,  { win = input_win })
+  vim.api.nvim_set_option_value("number",     false, { win = input_win })
+  vim.api.nvim_set_option_value("signcolumn", "no",  { win = input_win })
+  vim.api.nvim_set_option_value("cursorline", false, { win = input_win })
+  -- statusline shows a simple prompt label
+  vim.api.nvim_set_option_value("statusline", " dcode  ask  <CR> submit  <Esc> back ", { win = input_win })
+  vim.api.nvim_set_option_value("winhighlight",
+    "Normal:Normal,NormalFloat:Normal,StatusLine:DcodeBorder,StatusLineNC:DcodeBorder",
+    { win = input_win })
+
+  -- Let ui.lua know about the input win so close() shuts both down
+  ui.set_input_win(input_win)
+
+  -- ── Keymaps ────────────────────────────────────────────────────────────────
+  local ko = { buffer = input_buf, noremap = true, silent = true }
+
   local function submit()
-    if not input_buf or not vim.api.nvim_buf_is_valid(input_buf) then return end
+    if not input_buf_valid() then return end
     local lines = vim.api.nvim_buf_get_lines(input_buf, 0, -1, false)
     local text  = vim.trim(table.concat(lines, "\n"))
-    M.close_input()
+    -- Clear the input buffer for next use
+    vim.api.nvim_buf_set_lines(input_buf, 0, -1, false, { "" })
+    -- Return focus to the result window
+    local rw = ui.result_winid()
+    if rw then vim.api.nvim_set_current_win(rw) end
     if text ~= "" and input_cb then
-      input_cb(text)
+      local cb = input_cb
+      input_cb = nil
+      cb(text)
     end
   end
 
-  local ko = { buffer = input_buf, noremap = true, silent = true }
-  vim.keymap.set("i", "<CR>",  submit,          ko)
-  vim.keymap.set("i", "<C-s>", submit,          ko)
-  vim.keymap.set("n", "<CR>",  submit,          ko)
-  vim.keymap.set("n", "<C-s>", submit,          ko)
-  vim.keymap.set({ "n","i" }, "<Esc>",   function() M.close_input() end, ko)
-  vim.keymap.set({ "n","i" }, "<C-c>",   function() M.close_input() end, ko)
+  local function back_to_result()
+    local rw = ui.result_winid()
+    if rw then
+      vim.api.nvim_set_current_win(rw)
+    end
+  end
 
-  -- Auto-close if focus leaves the input window
-  vim.api.nvim_create_autocmd("WinLeave", {
-    buffer  = input_buf,
-    once    = true,
-    callback= function()
-      vim.schedule(function()
-        if input_win_valid() then M.close_input() end
-      end)
-    end,
-  })
+  -- Submit: <CR> (normal) or <C-s> (insert or normal)
+  vim.keymap.set("n", "<CR>",  submit, ko)
+  vim.keymap.set("n", "<C-s>", submit, ko)
+  vim.keymap.set("i", "<C-s>", submit, ko)
+  -- NOTE: We intentionally do NOT bind <CR> in insert mode because users
+  -- commonly want multi-line prompts. <C-s> submits from insert mode.
+  -- <Esc> in insert: leave insert, stay in input pane (normal mode)
+  -- <Esc> in normal: go back to result window
+  vim.keymap.set("n", "<Esc>", back_to_result, ko)
+  -- q in the input pane closes the whole sidebar
+  vim.keymap.set("n", "q", function() ui.close() end, ko)
 
-  -- Start in insert mode at end of line
+  -- Start in insert mode
   vim.cmd("startinsert!")
+end
+
+-- ─── Public: focus or open input (bound to `i`/<CR> in result window) ────────
+
+function M.focus_or_open_input()
+  local cfg = require("dcode").config
+  if not ui.is_open() then ui.open(cfg.window) end
+  open_input_pane(function(text)
+    dispatch(text, text)
+  end, "")
+end
+
+-- Keep old name as alias so lazy spec key `<leader>da` still works:
+function M.open_input()
+  M.focus_or_open_input()
 end
 
 -- ─── Session readiness ────────────────────────────────────────────────────────
 
---- Ensure server up + session exists, then call cb(session_id).
---- Resumes the most-recent session on first use per Neovim session;
---- subsequent calls reuse the already-set current_id.
 ---@param cb fun(session_id: string)
 local function ensure_ready(cb)
   client.ping(function(alive)
@@ -149,7 +172,6 @@ local function ensure_ready(cb)
     if session.current_id then
       cb(session.current_id)
     else
-      -- Resume latest or create new
       session.resume_or_create(nil, function(ok, id)
         if ok then cb(id) end
       end)
@@ -159,8 +181,8 @@ end
 
 -- ─── Context builder ─────────────────────────────────────────────────────────
 
----@param selection boolean  Use visual selection if true, else full buffer
----@return string  fenced context block (empty string if nothing)
+---@param selection boolean
+---@return string
 local function get_context(selection)
   local lines
   local ft    = vim.bo.filetype or ""
@@ -183,10 +205,10 @@ end
 
 -- ─── Core dispatch ────────────────────────────────────────────────────────────
 
---- Send a prompt to dcode. Shows display_text in UI, sends full_msg to API.
----@param full_msg    string
+--- Send prompt to dcode; open sidebar first if needed.
+---@param full_msg     string
 ---@param display_text string
-local function dispatch(full_msg, display_text)
+function dispatch(full_msg, display_text)
   local cfg = require("dcode").config
   if not ui.is_open() then ui.open(cfg.window) end
   ensure_ready(function(sid)
@@ -198,17 +220,7 @@ end
 
 -- ─── Public commands ─────────────────────────────────────────────────────────
 
---- Open the floating input window (bound to `i` in chat, and <leader>da).
-function M.open_input()
-  local cfg = require("dcode").config
-  if not ui.is_open() then ui.open(cfg.window) end
-  open_input_win("dcode  ask", "", function(text)
-    dispatch(text, text)
-  end)
-end
-
---- Ask with the current buffer as additional context.
----@param prompt string|nil  If nil, opens input window
+---@param prompt string|nil
 function M.ask(prompt)
   if prompt then
     local ctx  = get_context(false)
@@ -219,14 +231,14 @@ function M.ask(prompt)
   end
 end
 
---- Ask with full file context (explicit label in UI).
 function M.context_ask()
-  open_input_win("dcode  full file", "", function(text)
+  local cfg = require("dcode").config
+  if not ui.is_open() then ui.open(cfg.window) end
+  open_input_pane(function(text)
     local ctx  = get_context(false)
     local full = ctx ~= "" and (ctx .. "\n\n" .. text) or text
-    local label = "[file] " .. text
-    dispatch(full, label)
-  end)
+    dispatch(full, "[file] " .. text)
+  end, "")
 end
 
 function M.explain()
@@ -260,7 +272,6 @@ function M.docs()
   dispatch(ctx .. "\n\nAdd clear inline documentation/comments.", "Add docs")
 end
 
---- Start a brand-new session (clears chat, resets session ID).
 function M.new_session()
   session.current_id = nil
   ui.reset()
@@ -271,7 +282,6 @@ function M.new_session()
   end)
 end
 
---- Show available models as a notification.
 function M.show_models()
   client.get("/model", function(ok, data)
     if not ok then

@@ -5,14 +5,14 @@ local M = {}
 
 ---@class DcodeConfig
 ---@field server     { host: string, port: integer }
----@field window     { style: "float"|"vsplit"|"split", width: number, height: number }
+---@field window     { style: "sidebar"|"float"|"vsplit"|"split", width: number, height: number }
 ---@field keymaps    { prefix: string, enabled: boolean }
 ---@field auto_start boolean
 
 ---@type DcodeConfig
 M.config = {
   server     = { host = "127.0.0.1", port = 4096 },
-  window     = { style = "float", width = 0.45, height = 0.80 },
+  window     = { style = "sidebar", width = 0.40, height = 0.80 },
   keymaps    = { prefix = "<leader>d", enabled = true },
   auto_start = false,
 }
